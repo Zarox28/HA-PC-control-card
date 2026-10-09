@@ -44,24 +44,12 @@ test('restart + uptime + icon keys survive the flatten/unflatten round-trip', ()
   assert.equal(round.icon, 'nas');
 });
 
-test('renders a custom MDI header icon', () => {
-  const card = document.createElement('pc-control-card');
-  card.setConfig({
-    status_entity: 'binary_sensor.pc',
-    icon: 'mdi:desktop-tower-monitor',
-  });
-  const icon = card.shadowRoot.querySelector('.header-icon');
-  assert.ok(icon);
-  assert.equal(icon.getAttribute('icon'), 'mdi:desktop-tower-monitor');
-});
-
-test('accepts the package variant MDI icon', () => {
-  const card = document.createElement('pc-control-card');
-  card.setConfig({
-    status_entity: 'binary_sensor.pc',
-    icon: 'mdi:package-variant-closed',
-  });
-  const icon = card.shadowRoot.querySelector('.header-icon');
-  assert.ok(icon);
-  assert.equal(icon.getAttribute('icon'), 'mdi:package-variant-closed');
+test('renders custom icons from Home Assistant namespaces', () => {
+  for (const iconName of ['mdi:desktop-tower-monitor', 'mdi:package-variant-closed', 'phu:package-variant-closed']) {
+    const card = document.createElement('pc-control-card');
+    card.setConfig({ status_entity: 'binary_sensor.pc', icon: iconName });
+    const icon = card.shadowRoot.querySelector('.header-icon');
+    assert.ok(icon);
+    assert.equal(icon.getAttribute('icon'), iconName);
+  }
 });

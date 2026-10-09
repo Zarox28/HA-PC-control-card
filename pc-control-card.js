@@ -609,7 +609,7 @@ const ICONS = {
 
 function headerIcon(icon) {
   if (ICONS[icon]) return ICONS[icon];
-  if (typeof icon === "string" && /^mdi:[a-z0-9-]+$/.test(icon)) {
+  if (typeof icon === "string" && /^[a-z0-9_-]+:[a-z0-9_-]+$/.test(icon)) {
     return `<ha-icon class="header-icon" icon="${escapeHtml(icon)}"></ha-icon>`;
   }
   return ICONS.pc;
@@ -1652,7 +1652,7 @@ const EDITOR_LABELS = {
   show_storage: "Show Storage",
   show_drives: "Show Drive health",
   accent_color: "Accent color (overrides theme)",
-  icon: "Header icon (`pc`, `nas`, or any MDI icon such as `mdi:desktop-tower-monitor`)",
+  icon: "Header icon (`pc`, `nas`, or any icon such as `mdi:desktop-tower-monitor` or `phu:package-variant-closed`)",
   _metric_cpu_usage: "CPU usage sensor (percent)",
   _metric_cpu_temp: "CPU temperature sensor (°C)",
   _metric_gpu_usage: "GPU usage sensor (percent or load)",

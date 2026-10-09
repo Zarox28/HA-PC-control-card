@@ -58,7 +58,7 @@ Edit your dashboard → **Add card → Manual** → paste one of the snippets be
 type: custom:pc-control-card
 variant: tile
 name: My PC                                # heading shown on the card
-icon: mdi:desktop-tower-monitor             # optional MDI icon; `pc` is the default
+icon: mdi:desktop-tower-monitor             # optional MDI/icon-pack icon; `pc` is the default
 status_entity: binary_sensor.YOUR_PC_PING  # a sensor that's `on` when the PC is reachable (ping, agent heartbeat, WOL switch state, ...)
 turn_on:  switch.YOUR_PC_WOL               # the entity that wakes the PC — WOL switch, script, etc.
 sleep:    button.YOUR_PC_SLEEP             # a button/script your PC agent exposes for sleep
@@ -245,7 +245,7 @@ filled. For an absolute **used / total** readout, pair the MB attributes and add
 | `show_ram_usage`   | no       | boolean                           | `true`                   | Show the RAM metric. |
 | `show_storage`     | no       | boolean                           | `true`                   | Show all volume usage rows. |
 | `show_drives`      | no       | boolean                           | `true`                   | Show the per-drive health rows (feature) / summary (chip). Only renders when `drives` is set. |
-| `icon`             | no       | string                            | `pc`                     | Header glyph. Use the built-in `pc`/`nas`, or any Home Assistant MDI icon (for example `mdi:desktop-tower-monitor`). |
+| `icon`             | no       | string                            | `pc`                     | Header glyph. Use the built-in `pc`/`nas`, or any installed Home Assistant icon namespace (for example `mdi:desktop-tower-monitor` or `phu:package-variant-closed`). |
 | `healthy_states`   | no       | string[]                          | `[normal, ok, healthy, good]` | Status values (case-insensitive) treated as a healthy drive. |
 | `drives`           | no       | array of `{ status, temp?, name? }` | —                      | One entry per physical disk. `status` is the text status sensor; `temp` an optional °C sensor; `name` the row label (default `Drive`, `Drive 2`, …). |
 | `accent_color`     | no       | CSS color string                  | HA's `--primary-color`   | Override the accent for this card only (e.g. `"#7a5af8"`, `"#2f9e6e"`, `"oklch(0.65 0.18 145)"`). Different PCs can have different accents without touching your theme. |
