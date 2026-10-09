@@ -1556,7 +1556,7 @@ const EDITOR_SCHEMA = [
     schema: [
       {
         name: "icon",
-        selector: { text: {} },
+        selector: { icon: {} },
       },
       { name: "accent_color", selector: { color_rgb: {} } },
     ],
@@ -1652,7 +1652,7 @@ const EDITOR_LABELS = {
   show_storage: "Show Storage",
   show_drives: "Show Drive health",
   accent_color: "Accent color (overrides theme)",
-  icon: "Header icon (`pc`, `nas`, or any icon such as `mdi:desktop-tower-monitor` or `phu:package-variant-closed`)",
+  icon: "Header icon",
   _metric_cpu_usage: "CPU usage sensor (percent)",
   _metric_cpu_temp: "CPU temperature sensor (°C)",
   _metric_gpu_usage: "GPU usage sensor (percent or load)",
