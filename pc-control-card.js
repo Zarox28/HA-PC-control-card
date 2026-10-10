@@ -9,7 +9,7 @@
  *                 one bar per disk, custom rows) + uptime + 3 actions
  */
 
-const CARD_VERSION = "1.8.2";
+const CARD_VERSION = "1.8.3";
 
 // ── State machine ───────────────────────────────────────────────────
 //   off / on are derived from the binary_sensor.
@@ -63,14 +63,6 @@ const METRIC_LABELS = {
 // so old configs surface correctly in the visual editor too.
 function migrateConfig(raw) {
   const out = { ...raw };
-  // Visibility flags — only copy if the new key isn't already set.
-  if (out.show_cpu !== undefined && out.show_cpu_usage === undefined) out.show_cpu_usage = out.show_cpu;
-  if (out.show_ram !== undefined && out.show_ram_usage === undefined) out.show_ram_usage = out.show_ram;
-  if (out.show_gpu !== undefined && out.show_gpu_usage === undefined) out.show_gpu_usage = out.show_gpu;
-  delete out.show_cpu;
-  delete out.show_ram;
-  delete out.show_gpu;
-
   if (out.metrics) {
     const m = { ...out.metrics };
     if (m.cpu && !m.cpu_usage) m.cpu_usage = m.cpu;
@@ -1067,22 +1059,6 @@ export class PcControlCard extends HTMLElementBase {
       variant: "tile",
       name: "My PC",
       status_entity: "binary_sensor.pc_status",
-      turn_on: "switch.my_pc",
-      sleep: "button.my_pc_sleep",
-      shutdown: "button.my_pc_shutdown",
-      confirm_shutdown: true,
-      confirm_sleep: false,
-      show_turn_on: true,
-      show_sleep: true,
-      show_shutdown: true,
-      metrics: {
-        cpu_usage: "sensor.my_pc_cpu_percent",
-        // cpu_temp: 'sensor.my_pc_cpu_temp',     // °C — default off
-        ram_usage: "sensor.my_pc_ram_percent",
-        gpu_usage: "sensor.my_pc_gpu_load",
-        // gpu_temp: 'sensor.my_pc_gpu_temp',     // °C — default off
-        storages: [{ entity: "sensor.my_pc_storage_percent", name: "Disk" }],
-      },
     };
   }
 
@@ -1170,14 +1146,14 @@ export class PcControlCard extends HTMLElementBase {
       }));
   }
 
-  // Normalize the optional top-level `custom_metrics` array into clean
+  // Normalize the optional `metrics.custom` array into clean
   // { entity, name, attribute, unit, template, bar, max, maxEntity,
   //   maxAttribute } records. Entries
   // without an `entity` are dropped. `name` stays null when unset — the
   // label then falls back to the entity's friendly_name at render time
   // (hass isn't available yet when the config is set).
   _normalizeCustomMetrics() {
-    const c = this._config.custom_metrics;
+    const c = this._config.metrics?.custom;
     if (!Array.isArray(c)) return [];
     return c
       .filter((x) => x && typeof x.entity === "string" && x.entity)
@@ -1262,8 +1238,17 @@ export class PcControlCard extends HTMLElementBase {
       return fromItem(this._drives?.[+di]?.volumes?.[+vi]) || null;
     }
     const plain = { totalId: null, attribute: null, totalAttribute: null, unit: null, autoDetect: false };
-    if (key === "ram_usage") return { ...plain, entityId: m.ram_usage, totalId: m.ram_usage_total };
-    return { ...plain, entityId: m[key] };
+    const item = m[key];
+    if (!item || typeof item !== "object") return null;
+    return {
+      ...plain,
+      entityId: item.entity,
+      totalId: item.total,
+      attribute: item.attribute,
+      totalAttribute: item.total_attribute,
+      unit: item.unit,
+      autoDetect: !item.attribute,
+    };
   }
 
   // Resolve a metric entity (+ optional separate total entity) from hass
@@ -1304,19 +1289,17 @@ export class PcControlCard extends HTMLElementBase {
   }
 
   // ── Graphs ────────────────────────────────────────────────────
-  // Rows shown as a graph instead of a bar: built-ins via `metrics_display`
-  // (cpu_usage … ram_usage, `storage` = every storage row), custom rows via
-  // their own `display`. Feature variant only — chip shows values, tile none.
+  // Rows shown as a graph instead of a bar use their own metrics.*.display
+  // setting. Feature variant only — chip shows values, tile none.
   _initGraphs() {
-    const md = this._config.metrics_display || {};
+    const metrics = this._config.metrics || {};
     const hours = Number(this._config.graph_hours);
     this._graphHours = Number.isFinite(hours) && hours > 0 ? Math.min(720, hours) : GRAPH_DEFAULT_HOURS;
 
     const keys = new Set();
-    for (const k of METRIC_KEYS) if (md[k] === "graph") keys.add(k);
-    // A storage's own `display` wins over the `metrics_display.storage` default.
+    for (const k of METRIC_KEYS) if (metrics[k]?.display === "graph") keys.add(k);
     (this._storages || []).forEach((st, i) => {
-      if ((st.display ?? md.storage) === "graph") keys.add(`storage_${i}`);
+      if (st.display === "graph") keys.add(`storage_${i}`);
     });
     (this._customs || []).forEach((c, i) => c.display === "graph" && keys.add(`custom_${i}`));
     this._graphKeys = this._variant() === "feature" ? keys : new Set();
@@ -2579,22 +2562,18 @@ class PcControlCardEditor extends HTMLElementBase {
   }
 
   // Flatten metrics.* → _metric_* and metrics.storages[] → _storage_N_*
-  // so the form has one field per row. Always runs the migration
-  // first so a pre-1.1 config opened in the visual editor still
-  // surfaces with its entity ids populated.
+  // so the form has one field per row.
   _flatten(config) {
-    const migrated = migrateConfig(config || {});
+    const migrated = config || {};
     const m = migrated.metrics || {};
     const flat = { ...migrated };
-    // custom_metrics is edited by the dedicated list below, not the form.
-    delete flat.custom_metrics;
-    for (const k of METRIC_KEYS) flat[`_metric_${k}`] = m[k];
-    flat._metric_ram_usage_total = m.ram_usage_total;
-    const md = migrated.metrics_display || {};
-    delete flat.metrics_display;
-    for (const k of METRIC_KEYS) flat[`_display_${k}`] = md[k] === "graph" ? "graph" : "bar";
-    // A disk with no `display` of its own follows `metrics_display.storage`.
-    const storageDefault = md.storage === "graph" ? "graph" : "bar";
+    delete flat.metrics;
+    for (const k of METRIC_KEYS) {
+      const item = m[k] || {};
+      flat[`_metric_${k}`] = item.entity;
+      flat[`_display_${k}`] = item.display === "graph" ? "graph" : "bar";
+      if (k === "ram_usage") flat._metric_ram_usage_total = item.total;
+    }
 
     const storages = Array.isArray(m.storages) ? m.storages : [];
     for (let i = 0; i < STORAGE_SLOTS; i++) {
@@ -2605,7 +2584,7 @@ class PcControlCardEditor extends HTMLElementBase {
       flat[`_storage_${i + 1}_total_attribute`] = s.total_attribute;
       flat[`_storage_${i + 1}_unit`] = s.unit;
       flat[`_storage_${i + 1}_name`] = s.name;
-      flat[`_storage_${i + 1}_display`] = s.display === "graph" || s.display === "bar" ? s.display : storageDefault;
+      flat[`_storage_${i + 1}_display`] = s.display === "graph" || s.display === "bar" ? s.display : "bar";
     }
 
     const drives = Array.isArray(migrated.drives) ? migrated.drives : [];
@@ -2624,24 +2603,15 @@ class PcControlCardEditor extends HTMLElementBase {
     const metrics = {};
     for (const k of METRIC_KEYS) {
       const v = next[`_metric_${k}`];
-      if (v) metrics[k] = v;
+      if (v) {
+        metrics[k] = { entity: v };
+        if (next[`_display_${k}`] === "graph") metrics[k].display = "graph";
+      }
       delete next[`_metric_${k}`];
-    }
-    if (next._metric_ram_usage_total) metrics.ram_usage_total = next._metric_ram_usage_total;
-    delete next._metric_ram_usage_total;
-
-    // Only non-default displays are saved, so a stock config stays clean.
-    const metricsDisplay = {};
-    for (const k of METRIC_KEYS) {
-      if (next[`_display_${k}`] === "graph") metricsDisplay[k] = "graph";
       delete next[`_display_${k}`];
     }
-    // `metrics_display.storage` (YAML-only default for every disk) is kept
-    // as is; a disk saves its own `display` only when it differs from it.
-    const storageDefault = this._config?.metrics_display?.storage === "graph" ? "graph" : "bar";
-    if (storageDefault === "graph") metricsDisplay.storage = "graph";
-    if (Object.keys(metricsDisplay).length) next.metrics_display = metricsDisplay;
-    else delete next.metrics_display;
+    if (next._metric_ram_usage_total && metrics.ram_usage) metrics.ram_usage.total = next._metric_ram_usage_total;
+    delete next._metric_ram_usage_total;
     if (next.graph_hours === "" || next.graph_hours == null) delete next.graph_hours;
 
     const storages = [];
@@ -2655,7 +2625,7 @@ class PcControlCardEditor extends HTMLElementBase {
         if (next[`_storage_${i}_unit`]) item.unit = next[`_storage_${i}_unit`];
         if (next[`_storage_${i}_name`]) item.name = next[`_storage_${i}_name`];
         const disp = next[`_storage_${i}_display`];
-        if ((disp === "graph" || disp === "bar") && disp !== storageDefault) item.display = disp;
+        if (disp === "graph") item.display = disp;
         storages.push(item);
       }
       delete next[`_storage_${i}_entity`];
@@ -2691,17 +2661,18 @@ class PcControlCardEditor extends HTMLElementBase {
     if (drives.length) next.drives = drives;
     else delete next.drives;
 
-    // custom_metrics is owned by the list UI — carry it over from the
+    // metrics.custom is owned by the list UI — carry it over from the
     // current config so the main form can never drop or alter it.
-    if (this._customList().length) next.custom_metrics = this._customList();
-    else delete next.custom_metrics;
+    if (this._customList().length) metrics.custom = this._customList();
+    if (Object.keys(metrics).length) next.metrics = metrics;
+    else delete next.metrics;
     return next;
   }
 
   // ── Config plumbing ────────────────────────────────────────────
 
   _customList() {
-    return Array.isArray(this._config?.custom_metrics) ? this._config.custom_metrics : [];
+    return Array.isArray(this._config?.metrics?.custom) ? this._config.metrics.custom : [];
   }
 
   _fireConfig(next) {
@@ -2715,11 +2686,14 @@ class PcControlCardEditor extends HTMLElementBase {
     );
   }
 
-  // Commit a new custom_metrics list: update the config, tell HA, refresh.
+  // Commit a new metrics.custom list: update the config, tell HA, refresh.
   _setCustom(list) {
     const next = { ...this._config };
-    if (list.length) next.custom_metrics = list;
-    else delete next.custom_metrics;
+    const metrics = { ...(next.metrics || {}) };
+    if (list.length) metrics.custom = list;
+    else delete metrics.custom;
+    if (Object.keys(metrics).length) next.metrics = metrics;
+    else delete next.metrics;
     this._fireConfig(next);
     this._render();
   }
@@ -2810,7 +2784,7 @@ class PcControlCardEditor extends HTMLElementBase {
     this._syncAdd();
   }
 
-  // Keep the row list in step with config.custom_metrics. Rows are rebuilt
+  // Keep the row list in step with config.metrics.custom. Rows are rebuilt
   // only when the count changes; otherwise each row's picker is updated in
   // place (also what makes a drag-reorder just a data swap).
   _syncRows() {

@@ -11,8 +11,6 @@ function nasCard(extra = {}) {
     turn_on: 'switch.nas_wol',
     restart: 'button.nas_reboot',
     shutdown: 'button.nas_shutdown',
-    show_sleep: false,
-    show_restart: true,
     confirm_restart: false,
     ...extra,
   });
@@ -24,7 +22,7 @@ const onHass = (calls = []) => ({
   callService: (d, s, data) => calls.push([d, s, data]),
 });
 
-test('restart button visible when show_restart is true', () => {
+test('restart button visible when restart action is configured', () => {
   const card = nasCard();
   card.hass = onHass();
   assert.equal(card.shadowRoot.querySelector('.btn-restart').style.display, '');

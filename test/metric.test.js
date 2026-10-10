@@ -173,6 +173,30 @@ test('_metricValue scales a storage entry that declares a unit', () => {
   card.disconnectedCallback();
 });
 
+test('resolves native metrics from their object configuration', () => {
+  const card = new PcControlCard();
+  card.setConfig({
+    variant: 'feature',
+    status_entity: 'binary_sensor.pc',
+    metrics: {
+      cpu_usage: { entity: 'sensor.cpu', display: 'graph' },
+      ram_usage: { entity: 'sensor.ram_used', total: 'sensor.ram_total' },
+    },
+  });
+  card.hass = {
+    states: {
+      'binary_sensor.pc': { state: 'on', attributes: {} },
+      'sensor.cpu': { state: '42', attributes: { unit_of_measurement: '%' } },
+      'sensor.ram_used': { state: '6.8', attributes: { unit_of_measurement: 'GB' } },
+      'sensor.ram_total': { state: '16', attributes: {} },
+    },
+  };
+  assert.equal(metricValue(card, 'cpu_usage').displayValue, '42%');
+  assert.equal(metricValue(card, 'ram_usage').displayValue, '6.80 / 16.0 GB');
+  assert.equal(card._graphKeys.has('cpu_usage'), true);
+  card.disconnectedCallback();
+});
+
 // ── Distribution invariant ──────────────────────────────────────────
 
 test('docs/ demo copy is byte-identical to the root card', () => {

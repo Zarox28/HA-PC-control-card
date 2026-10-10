@@ -72,10 +72,10 @@ test('feature drive without a temp sensor shows capitalized status text', () => 
   card.disconnectedCallback();
 });
 
-test('drive rows remain available when the legacy show_drives flag is false', () => {
+test('drive rows render when drives are configured', () => {
   const feat = document.createElement('pc-control-card');
   feat.setConfig({
-    variant: 'feature', status_entity: 'binary_sensor.nas', show_drives: false,
+    variant: 'feature', status_entity: 'binary_sensor.nas',
     drives: [{ status: 'sensor.d1_status', name: 'Drive 1' }],
   });
   feat.hass = driveStates();
@@ -84,7 +84,7 @@ test('drive rows remain available when the legacy show_drives flag is false', ()
 
   const chip = document.createElement('pc-control-card');
   chip.setConfig({
-    variant: 'chip', status_entity: 'binary_sensor.nas', show_drives: false,
+    variant: 'chip', status_entity: 'binary_sensor.nas',
     drives: [{ status: 'sensor.d1_status', name: 'Drive 1' }],
   });
   chip.hass = driveStates();
