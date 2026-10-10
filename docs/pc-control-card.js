@@ -17,6 +17,7 @@ const CARD_VERSION = "1.8.1";
 //   resolve when the sensor flips, or expire after a timeout.
 
 const PENDING_TIMEOUT_MS = 300_000;
+const RESTART_CONFIRM_DELAY_MS = 3_000;
 const SLEEP_DISPLAY_MS = 6_000;
 const ACTION_ERROR_DISPLAY_MS = 8_000;
 const ARM_TIMEOUT_MS = 2_400;
@@ -1024,13 +1025,17 @@ export class PcControlCard extends HTMLElementBase {
     this._hass = hass;
     // Clear pending overlay when the sensor confirms the action.
     if (this._pending && hass) {
-      const s = hass.states[this._config.status_entity]?.state;
+      const statusEntity = hass.states[this._config.status_entity];
+      const s = statusEntity?.state;
       if (this._pending === "on" && s === "on") this._clearPending();
       if (this._pending === "shutdown" && s === "off") this._clearPending();
       if (this._pending === "restart") {
         // Reboot takes the box down (off/unavailable) then back to on.
         if (s !== "on") this._restartDipped = true;
-        if (this._restartDipped && s === "on") this._clearPending();
+        const changedAt = Date.parse(statusEntity?.last_changed || statusEntity?.last_updated || "");
+        const statusChangedAfterAction = Number.isFinite(changedAt) && changedAt >= this._pendingSince;
+        const restartStarted = Date.now() - this._pendingSince >= RESTART_CONFIRM_DELAY_MS;
+        if ((this._restartDipped || statusChangedAfterAction || restartStarted) && s === "on") this._clearPending();
       }
       if (
         this._actionError &&
