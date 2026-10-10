@@ -86,6 +86,47 @@ test('restarting keeps waiting when the dip is never seen before the timeout', (
   card.disconnectedCallback();
 });
 
+test('restarting clears when the status returns on after an unseen state update', () => {
+  const card = nasCard();
+  const base = (st, changedAt) => ({
+    states: {
+      'binary_sensor.nas': {
+        state: st,
+        last_changed: new Date(changedAt).toISOString(),
+        attributes: {},
+      },
+    },
+    callService() {},
+  });
+  const beforeAction = Date.now() - 1_000;
+  card.hass = base('on', beforeAction);
+  card._onRestart();
+  assert.equal(card._derivedStatus(), 'restarting');
+  card.hass = base('on', Date.now() + 1_000);
+  assert.equal(card._derivedStatus(), 'on');
+  card.disconnectedCallback();
+});
+
+test('restarting clears when the status stays on after the confirmation delay', () => {
+  const card = nasCard();
+  const base = () => ({
+    states: {
+      'binary_sensor.nas': {
+        state: 'on',
+        last_changed: new Date().toISOString(),
+        attributes: {},
+      },
+    },
+    callService() {},
+  });
+  card.hass = base();
+  card._onRestart();
+  card._pendingSince = Date.now() - 3_001;
+  card.hass = base();
+  assert.equal(card._derivedStatus(), 'on');
+  card.disconnectedCallback();
+});
+
 test('timeout errors use alert styling on the whole card', () => {
   const card = nasCard();
   card.hass = onHass();

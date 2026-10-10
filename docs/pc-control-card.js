@@ -9,7 +9,7 @@
  *                 one bar per disk, custom rows) + uptime + 3 actions
  */
 
-const CARD_VERSION = "1.8.1";
+const CARD_VERSION = "1.8.2";
 
 // ── State machine ───────────────────────────────────────────────────
 //   off / on are derived from the binary_sensor.
