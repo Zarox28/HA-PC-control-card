@@ -9,7 +9,7 @@
  *                 one bar per disk, custom rows) + uptime + 3 actions
  */
 
-const CARD_VERSION = "1.8.0";
+const CARD_VERSION = "1.8.1";
 
 // ── State machine ───────────────────────────────────────────────────
 //   off / on are derived from the binary_sensor.
@@ -1032,9 +1032,12 @@ export class PcControlCard extends HTMLElementBase {
         if (s !== "on") this._restartDipped = true;
         if (this._restartDipped && s === "on") this._clearPending();
       }
-      if (this._actionError && ((this._actionError === "boot_timeout" && s === "on") ||
-        (this._actionError === "shutdown_timeout" && s === "off") ||
-        (this._actionError === "restart_timeout" && s === "on"))) {
+      if (
+        this._actionError &&
+        ((this._actionError === "boot_timeout" && s === "on") ||
+          (this._actionError === "shutdown_timeout" && s === "off") ||
+          (this._actionError === "restart_timeout" && s === "on"))
+      ) {
         this._clearActionError();
       }
     }
@@ -2201,6 +2204,10 @@ const EDITOR_SCHEMA = [
         selector: { icon: {} },
       },
       { name: "accent_color", selector: { color_rgb: {} } },
+      {
+        name: "graph_hours",
+        selector: { number: { min: 1, max: 720, step: 1, mode: "box", unit_of_measurement: "h" } },
+      },
     ],
   },
 
@@ -2216,11 +2223,6 @@ const EDITOR_SCHEMA = [
         ...(k === "ram_usage" ? [{ name: "_metric_ram_usage_total", selector: { entity: { domain: "sensor" } } }] : []),
         { name: `_display_${k}`, selector: DISPLAY_SELECT },
       ]),
-      { name: "_metrics_divider_graph_period", type: "divider" },
-      {
-        name: "graph_hours",
-        selector: { number: { min: 1, max: 720, step: 1, mode: "box", unit_of_measurement: "h" } },
-      },
     ],
   },
 
