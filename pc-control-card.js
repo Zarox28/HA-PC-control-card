@@ -4,23 +4,54 @@
  * A drop-in custom card with three variants:
  *   - `tile`    — compact toggle tile with 3 action buttons
  *   - `chip`    — Mushroom-style: icon chip + inline uptime + mini metrics
- *                 (CPU/GPU usage + temps, RAM, one row per disk)
+ *                 (CPU/GPU usage + temps, RAM, one row per disk, custom rows)
  *   - `feature` — full card with metric bars (CPU/GPU usage + temps, RAM,
- *                 one bar per disk) + uptime + 3 actions
+ *                 one bar per disk, custom rows) + uptime + 3 actions
+ *
+ * Custom metrics (1.5+):
+ *   `custom_metrics` is a free list of extra rows — a number or any text
+ *   read from an entity state or attribute:
+ *
+ *     custom_metrics:
+ *       - entity: sensor.node_updates
+ *         name: Updates
+ *         template: "{value} available"
+ *       - entity: sensor.node_status
+ *         name: Status
+ *       - entity: sensor.node_info
+ *         name: Version
+ *         attribute: version
+ *       - entity: sensor.node_disk_free
+ *         name: Free
+ *         unit: GB
+ *         bar: true
+ *         max: 500
+ *       - entity: sensor.node_disk_used
+ *         name: Used
+ *         unit: GB
+ *         template: "{value} / {max}"
+ *         bar: true
+ *         max_entity: sensor.node_disk_total
+ *
+ *   Fields: entity (required), name, attribute, unit, template
+ *   ({value} and {max} placeholders), bar (progress bar, numeric values
+ *   only) + its maximum, either a fixed `max` (default 100) or the state of
+ *   a `max_entity` (optionally one of its `max_attribute`s, in the same unit
+ *   as the value).
  *
  * Install:
  *   1. Save this file to `/config/www/pc-control-card.js`
  *   2. Settings → Dashboards → ⋮ → Resources → Add Resource
  *        URL: /local/pc-control-card.js
  *        Type: JavaScript Module
- *   3. Add the card via YAML (see README.md)
+ *   3. Add the card via YAML (see README.md) or the visual editor
  *
  * Theme: follows HA's --card-background-color, --primary-text-color,
  *        --secondary-text-color, --divider-color, --primary-color,
  *        --error-color. Light & dark themes Just Work.
  */
 
-const CARD_VERSION = "1.4.0";
+const CARD_VERSION = "1.6.0";
 
 // ── State machine ───────────────────────────────────────────────────
 //   off / on are derived from the binary_sensor.
@@ -269,6 +300,141 @@ export function computeMetricDisplay(ent, totalEnt, opts = {}) {
   return { displayValue: pct, compactValue: pct, barPct: Math.max(0, Math.min(100, value)) };
 }
 
+// ── Custom metrics ──────────────────────────────────────────────────
+
+// Strict numeric check — `Number("1.2.3")` is NaN but `Number("0x10")` is 16
+// and `parseFloat("1.2.3")` is 1.2, so a regex gates what counts as a number.
+const NUMERIC_RE = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+
+// Integers stay integers ("11", not "11.0"); anything else gets at most
+// two decimals with trailing zeros dropped ("12.50" → "12.5").
+export function fmtCustomNumber(n) {
+  if (Number.isInteger(n)) return String(n);
+  return String(parseFloat(n.toFixed(2)));
+}
+
+// "in 27 days" / "3 hours ago" for timestamp sensors (e.g. "Certificate
+// expires"). Uses the browser's Intl so it follows the HA language.
+export function fmtRelativeTime(diffMs, locale) {
+  const abs = Math.abs(diffMs);
+  const steps = [
+    ["second", 1000, 60_000],
+    ["minute", 60_000, 3_600_000],
+    ["hour", 3_600_000, 86_400_000],
+    ["day", 86_400_000, 2_592_000_000],
+    ["month", 2_592_000_000, 31_536_000_000],
+  ];
+  let unit = "year";
+  let div = 31_536_000_000;
+  for (const [u, d, limit] of steps) {
+    if (abs < limit) {
+      unit = u;
+      div = d;
+      break;
+    }
+  }
+  const v = Math.round(diffMs / div);
+  for (const loc of [locale || undefined, undefined]) {
+    try {
+      return new Intl.RelativeTimeFormat(loc, { numeric: "auto" }).format(v, unit);
+    } catch {
+      /* invalid locale → retry with the default one */
+    }
+  }
+  return `${v} ${unit}`;
+}
+
+// Strict number from a state/attribute value, or null.
+function toStrictNumber(raw) {
+  if (typeof raw === "number") return Number.isFinite(raw) ? raw : null;
+  if (typeof raw === "string" && NUMERIC_RE.test(raw.trim())) return Number(raw.trim());
+  return null;
+}
+
+// Pure resolver for one custom metric row. Returns null when there's no
+// usable value (entity missing, unavailable/unknown, empty attribute).
+//
+//   - value comes from opts.attribute, else the entity state
+//   - numeric values keep integers as integers and get the unit
+//     (opts.unit, else the entity's unit_of_measurement — state only)
+//   - text values are shown as-is; the unit is not applied to text
+//   - timestamp sensors (device_class "timestamp") show a relative time
+//   - opts.template replaces "{value}" with the formatted value and
+//     "{max}" with the bar maximum (same unit; "—" when there is none)
+//   - opts.bar + numeric value → barPct against the maximum, which is
+//       · opts.maxEntity set → the number read from opts.maxEnt (its state,
+//         or opts.maxAttribute). If that isn't a positive number there is
+//         NO fallback: the bar stays empty rather than lie.
+//       · otherwise opts.max, defaulting to 100.
+//
+// displayValue is the template-applied text, compactValue the bare value
+// (used by the narrow chip variant).
+export function computeCustomDisplay(ent, opts = {}) {
+  if (!ent) return null;
+  const {
+    attribute = null,
+    unit: unitOverride = null,
+    template = null,
+    bar = false,
+    max = null,
+    maxEntity = null,
+    maxEnt = null,
+    maxAttribute = null,
+    locale = null,
+    now = Date.now(),
+  } = opts;
+
+  let raw;
+  if (attribute) {
+    raw = ent.attributes?.[attribute];
+  } else {
+    raw = ent.state;
+    if (raw === "unavailable" || raw === "unknown") return null;
+  }
+  if (raw === undefined || raw === null) return null;
+  if (Array.isArray(raw)) raw = raw.join(", ");
+  else if (typeof raw === "object") raw = JSON.stringify(raw);
+
+  const str = String(raw).trim();
+  if (str === "") return null;
+
+  // Bar maximum: from an entity (+ optional attribute) or a fixed number.
+  let maxN = null;
+  if (maxEntity) {
+    const n = toStrictNumber(maxAttribute ? maxEnt?.attributes?.[maxAttribute] : maxEnt?.state);
+    maxN = n != null && n > 0 ? n : null;
+  } else if (Number.isFinite(max) && max > 0) {
+    maxN = max;
+  }
+
+  const isNum = typeof raw === "number" ? Number.isFinite(raw) : NUMERIC_RE.test(str);
+  let text;
+  let unitSuffix = "";
+  let barPct = null;
+  if (isNum) {
+    const n = typeof raw === "number" ? raw : Number(str);
+    const unit = unitOverride ?? (attribute ? "" : (ent.attributes?.unit_of_measurement ?? ""));
+    unitSuffix = unit ? (unit === "%" ? "" : " ") + unit : "";
+    text = fmtCustomNumber(n) + unitSuffix;
+    if (bar) {
+      const barMax = maxEntity ? maxN : (maxN ?? 100);
+      if (barMax != null) barPct = Math.max(0, Math.min(100, (n / barMax) * 100));
+    }
+  } else if (!attribute && ent.attributes?.device_class === "timestamp" && Number.isFinite(Date.parse(str))) {
+    text = fmtRelativeTime(Date.parse(str) - now, locale);
+  } else {
+    text = str;
+  }
+
+  let displayValue = text;
+  if (template) {
+    const maxText = maxN != null ? fmtCustomNumber(maxN) + unitSuffix : "—";
+    // Single pass so a value that happens to contain "{max}" isn't re-expanded.
+    displayValue = String(template).replace(/\{(value|max)\}/g, (_m, k) => (k === "value" ? text : maxText));
+  }
+  return { displayValue, compactValue: text, barPct };
+}
+
 // ── Styles ──────────────────────────────────────────────────────────
 // Named STYLES (not CSS) to avoid shadowing the global `CSS` object.
 
@@ -484,6 +650,13 @@ const STYLES = `
   font-variant-numeric: tabular-nums;
   margin-top: 1px;
 }
+/* Custom rows can hold free text (a status, a version…) — keep them from
+   stretching the grid; the full text stays available as a tooltip. */
+.chip .mini-stat.custom .mlabel,
+.chip .mini-stat.custom .mval {
+  max-width: 120px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .chip .divider { height: 1px; background: var(--spc-border); margin: 0 18px; }
 .chip .actions { display: flex; gap: 8px; padding: 18px; }
 
@@ -542,6 +715,15 @@ const STYLES = `
   width: 0;
   transition: width 600ms cubic-bezier(.4,0,.2,1);
 }
+/* Custom rows: label + free-form value, with an optional bar. A row
+   without a bar has no use for the head's bottom margin. */
+.metric.custom .metric-head { gap: 12px; }
+.metric.custom .metric-head .mlabel { flex-shrink: 0; }
+.metric.custom .metric-head .mval {
+  min-width: 0; text-align: right;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.metric.no-bar .metric-head { margin-bottom: 0; }
 .feature .actions {
   margin-top: auto;
   padding: 22px;
@@ -666,6 +848,7 @@ export class PcControlCard extends HTMLElementBase {
       show_ram_usage: true,
       show_storage: true,
       show_drives: true,
+      show_custom_metrics: true,
       accent_color: null,
       healthy_states: null,
       icon: "pc",
@@ -674,6 +857,7 @@ export class PcControlCard extends HTMLElementBase {
     };
     this._storages = this._normalizeStorages();
     this._drives = this._normalizeDrives();
+    this._customs = this._normalizeCustomMetrics();
     this._healthyStates = (
       Array.isArray(this._config.healthy_states) && this._config.healthy_states.length
         ? this._config.healthy_states
@@ -827,6 +1011,48 @@ export class PcControlCard extends HTMLElementBase {
       }));
   }
 
+  // Normalize the optional top-level `custom_metrics` array into clean
+  // { entity, name, attribute, unit, template, bar, max, maxEntity,
+  //   maxAttribute } records. Entries
+  // without an `entity` are dropped. `name` stays null when unset — the
+  // label then falls back to the entity's friendly_name at render time
+  // (hass isn't available yet when the config is set).
+  _normalizeCustomMetrics() {
+    const c = this._config.custom_metrics;
+    if (!Array.isArray(c)) return [];
+    return c
+      .filter((x) => x && typeof x.entity === "string" && x.entity)
+      .map((x) => {
+        const max = Number(x.max);
+        return {
+          entity: x.entity,
+          name: x.name ? String(x.name) : null,
+          attribute: x.attribute ? String(x.attribute) : null,
+          unit: x.unit != null && x.unit !== "" ? String(x.unit) : null,
+          template: x.template ? String(x.template) : null,
+          bar: x.bar === true,
+          // null = "not set" (the bar then defaults to 100; {max} shows "—")
+          max: Number.isFinite(max) && max > 0 ? max : null,
+          maxEntity: typeof x.max_entity === "string" && x.max_entity ? x.max_entity : null,
+          maxAttribute: x.max_attribute ? String(x.max_attribute) : null,
+        };
+      });
+  }
+
+  // Label for a custom row: explicit name → entity friendly_name → entity id.
+  _customLabel(cm) {
+    return cm.name || this._hass?.states[cm.entity]?.attributes?.friendly_name || cm.entity;
+  }
+
+  // Push the (possibly hass-derived) label of a custom row into its
+  // .mlabel element, touching the DOM only when it actually changed.
+  _syncCustomLabel(labelEl, key) {
+    const cm = this._customs?.[parseInt(key.slice(7), 10)];
+    if (!cm || !labelEl) return;
+    const text = this._customLabel(cm);
+    if (labelEl.textContent !== text) labelEl.textContent = text;
+  }
+
   // Display string for a drive row: temperature ("38 °C") when a temp
   // sensor is configured and numeric, otherwise the capitalized status.
   _driveValue(d) {
@@ -847,7 +1073,8 @@ export class PcControlCard extends HTMLElementBase {
   // and delegate the parsing/formatting to computeMetricDisplay. Storage
   // entries are keyed by index: 'storage_0', 'storage_1', … and may pull
   // their value from an attribute; for HASS.Agent (non-numeric state) the
-  // value auto-detects from the UsedSpacePercentage attribute.
+  // value auto-detects from the UsedSpacePercentage attribute. Custom
+  // metrics ('custom_0', …) go through computeCustomDisplay instead.
   _metricValue(key) {
     const m = this._config.metrics || {};
     let entityId,
@@ -856,6 +1083,24 @@ export class PcControlCard extends HTMLElementBase {
       totalAttribute = null,
       autoDetect = false,
       unit = null;
+
+    if (key.startsWith("custom_")) {
+      const cm = this._customs?.[parseInt(key.slice(7), 10)];
+      if (!cm) return null;
+      const cent = this._hass?.states[cm.entity];
+      if (!cent) return null;
+      return computeCustomDisplay(cent, {
+        attribute: cm.attribute,
+        unit: cm.unit,
+        template: cm.template,
+        bar: cm.bar,
+        max: cm.max,
+        maxEntity: cm.maxEntity,
+        maxEnt: cm.maxEntity ? this._hass?.states[cm.maxEntity] : null,
+        maxAttribute: cm.maxAttribute,
+        locale: this._hass?.locale?.language || this._hass?.language || null,
+      });
+    }
 
     if (key === "storage" || key.startsWith("storage_")) {
       const idx = key === "storage" ? 0 : parseInt(key.slice(8), 10);
@@ -982,7 +1227,12 @@ export class PcControlCard extends HTMLElementBase {
   // ── Build / update ───────────────────────────────────────────
   _build() {
     const variant = this._variant();
-    const html = TEMPLATES[variant](this._storages || [], this._drives || [], headerIcon(this._config.icon));
+    const html = TEMPLATES[variant](
+      this._storages || [],
+      this._drives || [],
+      headerIcon(this._config.icon),
+      this._customs || [],
+    );
     this.shadowRoot.innerHTML = `<style>${STYLES}</style>${html}`;
 
     // Apply per-card accent color override (config: `accent_color`).
@@ -1090,30 +1340,36 @@ export class PcControlCard extends HTMLElementBase {
 
       const isOn = status === "on";
       const storageKeys = (this._storages || []).map((_, i) => `storage_${i}`);
-      [...METRIC_KEYS, ...storageKeys].forEach((k) => {
+      const customKeys = (this._customs || []).map((_, i) => `custom_${i}`);
+      [...METRIC_KEYS, ...storageKeys, ...customKeys].forEach((k) => {
         const row = root.querySelector(`.metric[data-key="${k}"]`);
         if (!row) return;
         // Hide the whole row when:
         //  - cpu_usage/cpu_temp/gpu_*/ram_usage: no entity OR show_<k> is false
         //  - storage_<i>: show_storage is false (entity always present
         //    because we filter in _normalizeStorages)
+        //  - custom_<i>: show_custom_metrics is false (entity always
+        //    present, filtered in _normalizeCustomMetrics)
         let enabled;
         if (k.startsWith("storage_")) {
           enabled = this._config.show_storage !== false;
+        } else if (k.startsWith("custom_")) {
+          enabled = this._config.show_custom_metrics !== false;
         } else {
           enabled = this._config[`show_${k}`] !== false && !!this._config.metrics?.[k];
         }
         row.style.display = enabled ? "" : "none";
         if (!enabled) return;
+        if (k.startsWith("custom_")) this._syncCustomLabel(row.querySelector(".mlabel"), k);
         const m = this._metricValue(k);
         const valEl = row.querySelector(".mval");
-        const fillEl = row.querySelector(".fill");
+        const fillEl = row.querySelector(".fill"); // absent on bar-less custom rows
         if (isOn && m) {
           valEl.textContent = m.displayValue;
-          fillEl.style.width = m.barPct != null ? `${m.barPct}%` : "0%";
+          if (fillEl) fillEl.style.width = m.barPct != null ? `${m.barPct}%` : "0%";
         } else {
           valEl.textContent = "—";
-          fillEl.style.width = "0%";
+          if (fillEl) fillEl.style.width = "0%";
         }
       });
 
@@ -1154,7 +1410,7 @@ export class PcControlCard extends HTMLElementBase {
       });
     }
 
-    // Chip-only: inline uptime + mini stats (cpu/ram/gpu + temps + first disk)
+    // Chip-only: inline uptime + mini stats (cpu/ram/gpu + temps + disks + custom)
     if (variant === "chip") {
       const up = this._uptime();
       const sep = root.querySelector(".uptime-sep");
@@ -1172,23 +1428,31 @@ export class PcControlCard extends HTMLElementBase {
       const isOn = status === "on";
       let anyMini = false;
       const chipStorageKeys = (this._storages || []).map((_, i) => `storage_${i}`);
-      [...METRIC_KEYS, ...chipStorageKeys].forEach((k) => {
+      const chipCustomKeys = (this._customs || []).map((_, i) => `custom_${i}`);
+      [...METRIC_KEYS, ...chipStorageKeys, ...chipCustomKeys].forEach((k) => {
         const stat = mini.querySelector(`.mini-stat[data-key="${k}"]`);
         if (!stat) return;
         let enabled;
         if (k.startsWith("storage_")) {
           enabled = this._config.show_storage !== false;
+        } else if (k.startsWith("custom_")) {
+          enabled = this._config.show_custom_metrics !== false;
         } else {
           enabled = this._config[`show_${k}`] !== false && !!this._config.metrics?.[k];
         }
         stat.style.display = enabled ? "" : "none";
         if (!enabled) return;
         anyMini = true;
+        const isCustom = k.startsWith("custom_");
+        if (isCustom) this._syncCustomLabel(stat.querySelector(".mlabel"), k);
         const cell = stat.querySelector(".mval");
         const m = isOn ? this._metricValue(k) : null;
-        // Chip uses the compact form (no "/ total" suffix) to fit the
-        // narrower mini-stat column.
+        // Chip uses the compact form (no "/ total" suffix, no template) to
+        // fit the narrower mini-stat column.
         cell.textContent = m ? m.compactValue : "—";
+        // Custom values are free text and may be ellipsized — keep the
+        // full templated text reachable as a tooltip.
+        if (isCustom) cell.title = m ? m.displayValue : "";
       });
 
       // Drives summary mini-stat (healthy/total), red if any unhealthy.
@@ -1300,7 +1564,7 @@ const TEMPLATES = {
     </ha-card>
   `,
 
-  chip: (storages, drives, iconSvg) => `
+  chip: (storages, drives, iconSvg, customs = []) => `
     <ha-card class="card chip">
       <div class="head">
         <div class="icon-box chip-icon">${iconSvg}<span class="ring" style="display:none"></span></div>
@@ -1333,6 +1597,16 @@ const TEMPLATES = {
           `,
             )
             .join("")}
+          ${customs
+            .map(
+              (_c, i) => `
+          <div class="mini-stat custom" data-key="custom_${i}">
+            <div class="mlabel"></div>
+            <div class="mval">—</div>
+          </div>
+          `,
+            )
+            .join("")}
           ${
             drives.length
               ? `
@@ -1355,7 +1629,7 @@ const TEMPLATES = {
     </ha-card>
   `,
 
-  feature: (storages, drives, iconSvg) => `
+  feature: (storages, drives, iconSvg, customs = []) => `
     <ha-card class="card feature">
       <div class="head">
         <div class="icon-box lg">${iconSvg}<span class="ring" style="display:none"></span></div>
@@ -1372,6 +1646,7 @@ const TEMPLATES = {
       <div class="metrics${drives.some((d) => d.volumes && d.volumes.length) ? " has-drive-volumes" : ""}">
         ${METRIC_KEYS.map((k) => metricRow(k, METRIC_LABELS[k])).join("")}
         ${storages.map((s, i) => metricRow(`storage_${i}`, escapeHtml(s.name).toUpperCase())).join("")}
+        ${customs.map((c, i) => metricRow(`custom_${i}`, "", false, { custom: true, bar: c.bar })).join("")}
         ${drives.map((d, i) => driveGroup(d, i)).join("")}
       </div>
 
@@ -1398,14 +1673,18 @@ function normalizeStorageItem(s, i, base) {
   };
 }
 
-function metricRow(key, label, nested) {
+// One metric row. `opts.custom` marks a custom-metric row (label filled in
+// at update time, free-text value styling); `opts.bar === false` omits the
+// progress bar entirely and tightens the row.
+function metricRow(key, label, nested, opts = {}) {
+  const noBar = opts.bar === false;
   return `
-    <div class="metric${nested ? " nested" : ""}" data-key="${key}">
+    <div class="metric${nested ? " nested" : ""}${opts.custom ? " custom" : ""}${noBar ? " no-bar" : ""}" data-key="${key}">
       <div class="metric-head">
         <span class="mlabel">${label}</span>
         <span class="mval">—</span>
       </div>
-      <div class="metric-bar"><div class="fill"></div></div>
+      ${noBar ? "" : '<div class="metric-bar"><div class="fill"></div></div>'}
     </div>
   `;
 }
@@ -1470,11 +1749,17 @@ function setBtn(btn, opts) {
 }
 
 // ── Visual editor ───────────────────────────────────────────────────
-// HA renders this in the dashboard card-edit dialog. It uses HA's
-// built-in <ha-form> with a schema — gives us entity pickers, a color
+// HA renders this in the dashboard card-edit dialog. The main part uses
+// HA's built-in <ha-form> with a schema — gives us entity pickers, a color
 // picker, toggles, dropdowns for free. <ha-form> only exists inside
 // the HA frontend; outside HA (e.g. on the GitHub Pages demo) this
 // class is unused.
+//
+// Custom metrics get a dedicated list modelled on the official Entities
+// card editor: drag handle · entity picker · remove · edit (pencil), an
+// "Add entity" button, and a sub-editor (back arrow, `{}` code toggle) for
+// the per-row fields. Reordering is a small native pointer-events drag
+// (no dependency on HA's lazy-loaded SortableJS), so it works on touch too.
 
 // How many storage slots the visual editor exposes. The card itself
 // accepts any number via YAML; this only caps the visible form fields.
@@ -1546,6 +1831,7 @@ const EDITOR_SCHEMA = [
       { name: "show_ram_usage", selector: { boolean: {} } },
       { name: "show_storage", selector: { boolean: {} } },
       { name: "show_drives", selector: { boolean: {} } },
+      { name: "show_custom_metrics", selector: { boolean: {} } },
     ],
   },
 
@@ -1651,6 +1937,7 @@ const EDITOR_LABELS = {
   show_ram_usage: "Show RAM",
   show_storage: "Show Storage",
   show_drives: "Show Drive health",
+  show_custom_metrics: "Show Custom metrics",
   accent_color: "Accent color (overrides theme)",
   icon: "Header icon",
   _metric_cpu_usage: "CPU usage sensor (percent)",
@@ -1692,10 +1979,199 @@ const EDITOR_LABELS = {
   _drive_4_name: "Drive 4 · label",
 };
 
+// ── Custom metrics editor: schemas, labels, icons ───────────────────
+
+// Each list row is a single entity picker (like the official Entities card).
+const CUSTOM_ROW_SCHEMA = [{ name: "entity", required: true, selector: { entity: {} } }];
+
+// Sub-editor form. The maximum only makes sense — and only shows — with a
+// bar. `max_source` is a UI-only switch (never saved): a fixed value, or an
+// entity (+ optional attribute) like the disks' `total`.
+function customRowSchema(withBar, maxMode) {
+  const schema = [
+    { name: "entity", required: true, selector: { entity: {} } },
+    { name: "name", selector: { text: {} } },
+    { name: "attribute", selector: { attribute: {} }, context: { filter_entity: "entity" } },
+    { name: "unit", selector: { text: {} } },
+    { name: "template", selector: { text: {} } },
+    { name: "bar", selector: { boolean: {} } },
+  ];
+  if (withBar) {
+    schema.push({
+      name: "max_source",
+      selector: {
+        select: {
+          mode: "dropdown",
+          options: [
+            { value: "value", label: "Fixed value" },
+            { value: "entity", label: "Entity" },
+          ],
+        },
+      },
+    });
+    if (maxMode === "entity") {
+      schema.push(
+        { name: "max_entity", selector: { entity: {} } },
+        { name: "max_attribute", selector: { attribute: {} }, context: { filter_entity: "max_entity" } },
+      );
+    } else {
+      schema.push({ name: "max", selector: { number: { mode: "box", min: 0, step: "any" } } });
+    }
+  }
+  return schema;
+}
+
+const CUSTOM_ROW_LABELS = {
+  entity: "Entity",
+  name: "Name",
+  attribute: "Attribute",
+  unit: "Unit",
+  template: "Template",
+  bar: "Progress bar",
+  max_source: "Bar maximum",
+  max: "Maximum value",
+  max_entity: "Maximum entity",
+  max_attribute: "Maximum attribute",
+};
+
+const CUSTOM_ROW_HELPERS = {
+  name: "Defaults to the entity's name",
+  attribute: "Read an attribute instead of the state",
+  unit: "Overrides the entity's unit (numeric values only)",
+  template: 'Placeholders: {value} and {max}, e.g. "{value} / {max}"',
+  bar: "Numeric values only",
+  max_source: "What fills the bar completely",
+  max: "Default 100",
+  max_entity: "Same unit as the value (e.g. a total-size sensor)",
+  max_attribute: "Read an attribute instead of the state",
+};
+
+// Keys the sub-editor form manages; any other key found in a row's YAML is
+// carried over untouched when the row is saved from the form.
+const CUSTOM_ROW_KEYS = [
+  "entity",
+  "name",
+  "attribute",
+  "unit",
+  "template",
+  "bar",
+  "max",
+  "max_entity",
+  "max_attribute",
+];
+
+// Material Design Icons paths (24×24) — the same glyphs HA's own editors use.
+const EDITOR_ICONS = {
+  drag: "M21 11H3V9H21V11M21 15H3V13H21V15Z",
+  close:
+    "M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z",
+  pencil:
+    "M20.71,7.04C21.1,6.65 21.1,6 20.71,5.63L18.37,3.29C18,2.9 17.35,2.9 16.96,3.29L15.12,5.12L18.87,8.87M3,17.25V21H6.75L17.81,9.93L14.06,6.18L3,17.25Z",
+  back: "M15.41,16.58L10.83,12L15.41,7.41L14,6L8,12L14,18L15.41,16.58Z",
+  add: "M3 16H10V14H3M18 14V10H16V14H12V16H16V20H18V16H22V14M14 6H3V8H14M14 10H3V12H14V10Z",
+  code: "M8,3A2,2 0 0,0 6,5V9A2,2 0 0,1 4,11H3V13H4A2,2 0 0,1 6,15V19A2,2 0 0,0 8,21H10V19H8V14A2,2 0 0,0 6,12A2,2 0 0,0 8,10V5H10V3M16,3A2,2 0 0,1 18,5V9A2,2 0 0,0 20,11H21V13H20A2,2 0 0,0 18,15V19A2,2 0 0,1 16,21H14V19H16V14A2,2 0 0,1 18,12A2,2 0 0,1 16,10V5H14V3H16Z",
+  list: "M19 5V19H5V5H19M19 3H5C3.9 3 3 3.9 3 5V19C3 20.1 3.9 21 5 21H19C20.1 21 21 20.1 21 19V5C21 3.9 20.1 3 19 3M11 7H17V9H11V7M11 11H17V13H11V11M11 15H17V17H11V15M7 7H9V9H7V7M7 11H9V13H7V11M7 15H9V17H7V15Z",
+};
+const eIcon = (name) => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${EDITOR_ICONS[name]}"/></svg>`;
+
+// HA's own icon button (core component, always loaded in the frontend) so
+// size, hover and ripple match the official editors exactly.
+function haIconButton(icon, label, cls) {
+  const b = document.createElement("ha-icon-button");
+  b.className = cls;
+  b.path = EDITOR_ICONS[icon];
+  b.label = label;
+  return b;
+}
+
+const EDITOR_STYLES = `
+:host { display: block; }
+.wrap { display: block; padding: 4px 0; }
+
+/* Section heading + hint (same 16px heading as "Entities (required)"). */
+.cm-section { margin-top: 24px; }
+.cm-title {
+  margin: 0 0 4px; font-size: 16px; font-weight: 500; line-height: 24px;
+  color: var(--primary-text-color);
+}
+.cm-hint { font-size: 12px; line-height: 1.5; color: var(--secondary-text-color); margin-bottom: 8px; }
+.cm-hint code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  background: color-mix(in srgb, var(--primary-text-color) 10%, transparent);
+  padding: 1px 4px; border-radius: 4px;
+}
+
+/* Rows — same anatomy as the Entities card editor:
+   24px handle + 8px gap · picker (grows) · 36px remove · 36px edit. */
+.cm-list { display: flex; flex-direction: column; gap: 8px; }
+.cm-row { display: flex; align-items: center; position: relative; }
+.cm-row.shifting { transition: transform 150ms ease; }
+.cm-row.dragging {
+  z-index: 2; transition: none; border-radius: 12px;
+  background: var(--card-background-color, var(--primary-background-color, #1c1c1c));
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+.handle {
+  display: flex; align-items: center; flex-shrink: 0;
+  padding-inline-end: 8px;
+  color: var(--primary-text-color);
+  cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none;
+}
+.cm-row.dragging .handle { cursor: grabbing; }
+.handle svg { display: block; width: 24px; height: 24px; fill: currentColor; pointer-events: none; }
+.row-form { flex: 1; min-width: 0; display: block; }
+.rm, .ed, .cancel {
+  --mdc-icon-button-size: 36px;
+  --ha-icon-button-size: 36px;
+  flex-shrink: 0;
+  color: var(--secondary-text-color);
+}
+
+/* "Add entity" sits under the pickers, aligned with their left edge
+   (24px handle + 8px gap = 32px). */
+.cm-add { margin-top: 8px; padding-inline-start: 32px; display: flex; align-items: center; }
+.cm-add ha-form { flex: 1; min-width: 0; display: block; }
+/* Fallback when ha-button isn't available: a 32px tonal pill. */
+button.add-btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  height: 32px; padding: 0 12px 0 10px;
+  border: none; border-radius: 999px; cursor: pointer;
+  font-size: 14px; font-weight: 500;
+  font-family: var(--paper-font-body1_-_font-family, Roboto, sans-serif);
+  color: var(--primary-color);
+  background: color-mix(in srgb, var(--primary-color) 18%, transparent);
+}
+button.add-btn:hover { background: color-mix(in srgb, var(--primary-color) 26%, transparent); }
+button.add-btn svg { width: 18px; height: 18px; fill: currentColor; }
+
+/* Sub-editor header: [48px back] [title] [48px code toggle], no gaps. */
+.sub-head { display: flex; align-items: center; margin-bottom: 8px; }
+.sub-title {
+  flex: 1; min-width: 0; font-size: 16px; font-weight: 500; line-height: 24px;
+  color: var(--primary-text-color);
+}
+.sub-body { display: block; }
+.sub-body ha-form { display: block; }
+textarea.json {
+  width: 100%; min-height: 220px; box-sizing: border-box; resize: vertical;
+  padding: 10px; border-radius: 8px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px;
+  color: var(--primary-text-color);
+  background: var(--card-background-color, transparent);
+  border: 1px solid var(--divider-color, rgba(127, 127, 127, 0.4));
+}
+textarea.json.invalid { border-color: var(--error-color, #db4437); }
+`;
+
 class PcControlCardEditor extends HTMLElementBase {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
+    this._view = null; // null = main view · number = index of the custom row being edited
+    this._yaml = false; // sub-editor shows the code view
+    this._maxMode = null; // sub-editor: "value" | "entity" while picking the bar maximum (null = derive from the row)
+    this._adding = false; // main view shows the "add entity" picker
+    this._mounted = null; // "main" | "sub" — which skeleton is in the shadow DOM
   }
 
   setConfig(config) {
@@ -1705,7 +2181,18 @@ class PcControlCardEditor extends HTMLElementBase {
 
   set hass(hass) {
     this._hass = hass;
-    this._render();
+    // `hass` is re-set on every state change in HA. Re-assigning each
+    // form's data every time would be wasteful (and fight with typing),
+    // so once mounted only the forms' own `hass` is refreshed.
+    if (!this._mounted) {
+      this._render();
+      return;
+    }
+    this._forms().forEach((f) => (f.hass = hass));
+  }
+
+  _forms() {
+    return [...this.shadowRoot.querySelectorAll("ha-form, ha-yaml-editor")];
   }
 
   // Flatten metrics.* → _metric_* and metrics.storages[] → _storage_N_*
@@ -1716,6 +2203,8 @@ class PcControlCardEditor extends HTMLElementBase {
     const migrated = migrateConfig(config || {});
     const m = migrated.metrics || {};
     const flat = { ...migrated };
+    // custom_metrics is edited by the dedicated list below, not the form.
+    delete flat.custom_metrics;
     for (const k of METRIC_KEYS) flat[`_metric_${k}`] = m[k];
     flat._metric_ram_usage_total = m.ram_usage_total;
 
@@ -1795,40 +2284,460 @@ class PcControlCardEditor extends HTMLElementBase {
     }
     if (drives.length) next.drives = drives;
     else delete next.drives;
+
+    // custom_metrics is owned by the list UI — carry it over from the
+    // current config so the main form can never drop or alter it.
+    if (this._customList().length) next.custom_metrics = this._customList();
+    else delete next.custom_metrics;
     return next;
   }
 
+  // ── Config plumbing ────────────────────────────────────────────
+
+  _customList() {
+    return Array.isArray(this._config?.custom_metrics) ? this._config.custom_metrics : [];
+  }
+
+  _fireConfig(next) {
+    this._config = next;
+    this.dispatchEvent(
+      new CustomEvent("config-changed", {
+        detail: { config: next },
+        bubbles: true,
+        composed: true,
+      }),
+    );
+  }
+
+  // Commit a new custom_metrics list: update the config, tell HA, refresh.
+  _setCustom(list) {
+    const next = { ...this._config };
+    if (list.length) next.custom_metrics = list;
+    else delete next.custom_metrics;
+    this._fireConfig(next);
+    this._render();
+  }
+
+  // ── Rendering ──────────────────────────────────────────────────
+
   _render() {
     if (!this._hass || !this._config) return;
-    if (this.shadowRoot.childNodes.length) {
-      // Update existing form with fresh data
-      const form = this.shadowRoot.querySelector("ha-form");
-      if (form) {
-        form.hass = this._hass;
-        form.data = this._flatten(this._config);
-      }
+    // The row being edited may vanish (config replaced from the code editor).
+    if (this._view != null && !this._customList()[this._view]) {
+      this._view = null;
+      this._yaml = false;
+      this._maxMode = null;
+    }
+    const want = this._view == null ? "main" : "sub";
+    if (this._mounted !== want) this._mount(want);
+    if (want === "main") this._refreshMain();
+    else this._refreshSub();
+  }
+
+  // Build the static skeleton of a view (main list or row sub-editor).
+  _mount(want) {
+    const root = this.shadowRoot;
+    root.innerHTML = `<style>${EDITOR_STYLES}</style>`;
+    this._mounted = want;
+
+    if (want === "main") {
+      this._adding = false;
+      const wrap = document.createElement("div");
+      wrap.className = "wrap";
+
+      const form = document.createElement("ha-form");
+      form.className = "main-form";
+      form.schema = EDITOR_SCHEMA;
+      form.computeLabel = (s) => EDITOR_LABELS[s.name] || s.name;
+      form.addEventListener("value-changed", (e) => {
+        this._fireConfig(this._unflatten(e.detail.value));
+      });
+      wrap.appendChild(form);
+
+      const sec = document.createElement("div");
+      sec.className = "cm-section";
+      sec.innerHTML = `
+        <h3 class="cm-title">Custom metrics</h3>
+        <div class="cm-hint">Extra rows for the Chip &amp; Feature variants. Pick an entity, then use the pencil to set a name, attribute, unit, <code>{value}</code> template or a progress bar.</div>
+        <div class="cm-list"></div>
+        <div class="cm-add"></div>
+      `;
+      wrap.appendChild(sec);
+      root.appendChild(wrap);
       return;
     }
-    const wrap = document.createElement("div");
-    wrap.style.cssText = "display: block; padding: 4px 0;";
-    const form = document.createElement("ha-form");
-    form.hass = this._hass;
-    form.data = this._flatten(this._config);
-    form.schema = EDITOR_SCHEMA;
-    form.computeLabel = (s) => EDITOR_LABELS[s.name] || s.name;
-    form.addEventListener("value-changed", (e) => {
-      const next = this._unflatten(e.detail.value);
-      this._config = next;
-      this.dispatchEvent(
-        new CustomEvent("config-changed", {
-          detail: { config: next },
-          bubbles: true,
-          composed: true,
-        }),
-      );
+
+    // Sub-editor skeleton
+    const sub = document.createElement("div");
+    sub.className = "wrap sub";
+    sub.innerHTML = `
+      <div class="sub-head"><div class="sub-title">Custom metric editor</div></div>
+      <div class="sub-body"></div>
+    `;
+    const head = sub.querySelector(".sub-head");
+    const back = haIconButton("back", "Back", "back");
+    const code = haIconButton("code", "Show code editor", "code");
+    back.addEventListener("click", () => {
+      this._view = null;
+      this._yaml = false;
+      this._maxMode = null;
+      this._render();
     });
-    wrap.appendChild(form);
-    this.shadowRoot.appendChild(wrap);
+    code.addEventListener("click", () => {
+      this._yaml = !this._yaml;
+      this._render();
+    });
+    head.prepend(back);
+    head.append(code);
+    root.appendChild(sub);
+  }
+
+  // ── Main view ──────────────────────────────────────────────────
+
+  _refreshMain() {
+    const form = this.shadowRoot.querySelector(".main-form");
+    if (form) {
+      form.hass = this._hass;
+      form.data = this._flatten(this._config);
+    }
+    this._syncRows();
+    this._syncAdd();
+  }
+
+  // Keep the row list in step with config.custom_metrics. Rows are rebuilt
+  // only when the count changes; otherwise each row's picker is updated in
+  // place (also what makes a drag-reorder just a data swap).
+  _syncRows() {
+    const cont = this.shadowRoot.querySelector(".cm-list");
+    if (!cont) return;
+    const list = this._customList();
+    if (cont.children.length !== list.length) {
+      cont.innerHTML = "";
+      list.forEach(() => cont.appendChild(this._buildRow(cont)));
+    }
+    [...cont.children].forEach((row, i) => {
+      const f = row.querySelector("ha-form");
+      f.hass = this._hass;
+      f.data = { entity: list[i].entity || "" };
+    });
+  }
+
+  _buildRow(cont) {
+    const row = document.createElement("div");
+    row.className = "cm-row";
+    const handle = document.createElement("div");
+    handle.className = "handle";
+    handle.title = "Drag to reorder";
+    handle.innerHTML = eIcon("drag");
+    const form = document.createElement("ha-form");
+    form.className = "row-form";
+    const rm = haIconButton("close", "Remove", "rm");
+    const ed = haIconButton("pencil", "Edit", "ed");
+    row.append(handle, form, rm, ed);
+
+    // Rows are positional: DOM order always mirrors the config order.
+    const idx = () => [...cont.children].indexOf(row);
+
+    form.schema = CUSTOM_ROW_SCHEMA;
+    form.computeLabel = () => ""; // like the official rows: no label, just the picker
+    form.addEventListener("value-changed", (e) => {
+      e.stopPropagation();
+      const ent = e.detail?.value?.entity;
+      const list = [...this._customList()];
+      const i = idx();
+      if (!ent || i < 0 || !list[i] || list[i].entity === ent) return;
+      list[i] = { ...list[i], entity: ent };
+      this._setCustom(list);
+    });
+
+    rm.addEventListener("click", () => {
+      const list = [...this._customList()];
+      const i = idx();
+      if (i < 0) return;
+      list.splice(i, 1);
+      this._setCustom(list);
+    });
+    ed.addEventListener("click", () => {
+      const i = idx();
+      if (i < 0) return;
+      this._view = i;
+      this._yaml = false;
+      this._maxMode = null;
+      this._render();
+    });
+    this._bindDrag(handle, row, cont);
+    return row;
+  }
+
+  // Drag-to-reorder on the handle. The dragged row follows the pointer;
+  // the others slide out of the way. On release the new order is committed.
+  _bindDrag(handle, row, cont) {
+    handle.addEventListener("pointerdown", (e) => {
+      if (e.button !== undefined && e.button !== 0) return;
+      const rows = [...cont.children];
+      const from = rows.indexOf(row);
+      if (rows.length < 2 || from < 0) return;
+      e.preventDefault();
+
+      const rects = rows.map((r) => r.getBoundingClientRect());
+      const gap = rects[1].top - rects[0].bottom;
+      const step = rects[from].height + gap;
+      const startY = e.clientY;
+      let to = from;
+
+      try {
+        handle.setPointerCapture(e.pointerId);
+      } catch {
+        /* synthetic events / unsupported — listeners on the handle still fire */
+      }
+      row.classList.add("dragging");
+      rows.forEach((r) => r !== row && r.classList.add("shifting"));
+
+      const onMove = (ev) => {
+        const dy = ev.clientY - startY;
+        row.style.transform = `translateY(${dy}px)`;
+        // Target slot = the row whose original centre is closest.
+        const centre = rects[from].top + rects[from].height / 2 + dy;
+        let best = Infinity;
+        rects.forEach((r, i) => {
+          const d = Math.abs(centre - (r.top + r.height / 2));
+          if (d < best) {
+            best = d;
+            to = i;
+          }
+        });
+        rows.forEach((r, i) => {
+          if (i === from) return;
+          let shift = 0;
+          if (from < to && i > from && i <= to) shift = -step;
+          else if (from > to && i < from && i >= to) shift = step;
+          r.style.transform = shift ? `translateY(${shift}px)` : "";
+        });
+      };
+
+      const finish = (commit) => {
+        handle.removeEventListener("pointermove", onMove);
+        handle.removeEventListener("pointerup", onUp);
+        handle.removeEventListener("pointercancel", onCancel);
+        try {
+          handle.releasePointerCapture(e.pointerId);
+        } catch {
+          /* already released */
+        }
+        rows.forEach((r) => {
+          r.style.transform = "";
+          r.classList.remove("dragging", "shifting");
+        });
+        if (commit && to !== from) {
+          const list = [...this._customList()];
+          list.splice(to, 0, list.splice(from, 1)[0]);
+          this._setCustom(list);
+        }
+      };
+      const onUp = () => finish(true);
+      const onCancel = () => finish(false);
+
+      handle.addEventListener("pointermove", onMove);
+      handle.addEventListener("pointerup", onUp);
+      handle.addEventListener("pointercancel", onCancel);
+    });
+  }
+
+  // "Add entity" — HA's tonal small button (same as the Entities card), which
+  // swaps for a one-shot entity picker. Picking an entity appends a row and
+  // puts the button back.
+  _makeAddButton() {
+    const onClick = () => {
+      this._adding = true;
+      this._syncAdd();
+    };
+    if (customElements.get("ha-button")) {
+      const b = document.createElement("ha-button");
+      b.className = "add-btn";
+      b.setAttribute("appearance", "filled");
+      b.setAttribute("size", "small");
+      const ic = document.createElement("ha-svg-icon");
+      ic.slot = "start";
+      ic.path = EDITOR_ICONS.add;
+      b.append(ic, "Add entity");
+      b.addEventListener("click", onClick);
+      return b;
+    }
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "add-btn";
+    b.innerHTML = `${eIcon("add")}<span>Add entity</span>`;
+    b.addEventListener("click", onClick);
+    return b;
+  }
+
+  _syncAdd() {
+    const box = this.shadowRoot.querySelector(".cm-add");
+    if (!box) return;
+    const mode = this._adding ? "picker" : "button";
+    if (box.dataset.mode === mode) {
+      const f = box.querySelector("ha-form");
+      if (f) f.hass = this._hass;
+      return;
+    }
+    box.dataset.mode = mode;
+    box.innerHTML = "";
+
+    if (mode === "button") {
+      box.appendChild(this._makeAddButton());
+      return;
+    }
+
+    const f = document.createElement("ha-form");
+    f.hass = this._hass;
+    f.schema = CUSTOM_ROW_SCHEMA;
+    f.data = { entity: "" };
+    f.computeLabel = () => "Entity";
+    f.addEventListener("value-changed", (e) => {
+      e.stopPropagation();
+      const ent = e.detail?.value?.entity;
+      if (!ent) return;
+      this._adding = false;
+      this._setCustom([...this._customList(), { entity: ent }]);
+    });
+    const cancel = haIconButton("close", "Cancel", "cancel");
+    cancel.addEventListener("click", () => {
+      this._adding = false;
+      this._syncAdd();
+    });
+    box.append(f, cancel);
+  }
+
+  // ── Sub-editor ─────────────────────────────────────────────────
+
+  _refreshSub() {
+    const root = this.shadowRoot;
+    const item = this._customList()[this._view] || {};
+    // Like the official sub-editor, the toggle swaps its glyph: `{}` while the
+    // visual form is shown, a form icon while the code view is shown.
+    const codeBtn = root.querySelector(".code");
+    codeBtn.path = this._yaml ? EDITOR_ICONS.list : EDITOR_ICONS.code;
+    codeBtn.label = this._yaml ? "Show visual editor" : "Show code editor";
+
+    const body = root.querySelector(".sub-body");
+    const mode = this._yaml ? "yaml" : "gui";
+    if (body.dataset.mode !== mode) {
+      body.dataset.mode = mode;
+      body.innerHTML = "";
+      body.appendChild(mode === "yaml" ? this._buildYaml(item) : this._buildSubForm());
+    }
+
+    if (mode === "gui") {
+      const f = body.querySelector("ha-form");
+      f.hass = this._hass;
+      // Swap the schema only when the bar toggle or the maximum source flips.
+      const withBar = !!item.bar;
+      const maxMode = this._maxMode ?? (item.max_entity ? "entity" : "value");
+      const schemaKey = `${withBar}|${maxMode}`;
+      if (f._schemaKey !== schemaKey) {
+        f._schemaKey = schemaKey;
+        f.schema = customRowSchema(withBar, maxMode);
+      }
+      f.data = {
+        entity: item.entity || "",
+        name: item.name,
+        attribute: item.attribute,
+        unit: item.unit,
+        template: item.template,
+        bar: withBar,
+        max_source: maxMode,
+        max: item.max,
+        max_entity: item.max_entity,
+        max_attribute: item.max_attribute,
+      };
+    } else {
+      // The code view keeps its own text while typing; only hass is refreshed.
+      const y = body.firstElementChild;
+      if (y && "hass" in y) y.hass = this._hass;
+    }
+  }
+
+  _buildSubForm() {
+    const f = document.createElement("ha-form");
+    f.computeLabel = (s) => CUSTOM_ROW_LABELS[s.name] || s.name;
+    f.computeHelper = (s) => CUSTOM_ROW_HELPERS[s.name];
+    f.addEventListener("value-changed", (e) => {
+      e.stopPropagation();
+      this._maxMode = e.detail.value?.max_source || null;
+      this._applyRow(this._formToRow(e.detail.value), true);
+    });
+    return f;
+  }
+
+  // Code view: HA's YAML editor when it's loaded, else a JSON textarea.
+  _buildYaml(item) {
+    if (customElements.get("ha-yaml-editor")) {
+      const y = document.createElement("ha-yaml-editor");
+      y.hass = this._hass;
+      y.defaultValue = item;
+      y.addEventListener("value-changed", (e) => {
+        e.stopPropagation();
+        const v = e.detail?.value;
+        if (e.detail?.isValid === false || !v || typeof v !== "object" || Array.isArray(v)) return;
+        this._applyRow(v);
+      });
+      return y;
+    }
+    const ta = document.createElement("textarea");
+    ta.className = "json";
+    ta.spellcheck = false;
+    ta.value = JSON.stringify(item, null, 2);
+    ta.addEventListener("input", () => {
+      try {
+        const v = JSON.parse(ta.value);
+        if (v && typeof v === "object" && !Array.isArray(v)) {
+          ta.classList.remove("invalid");
+          this._applyRow(v);
+          return;
+        }
+      } catch {
+        /* fall through */
+      }
+      ta.classList.add("invalid");
+    });
+    return ta;
+  }
+
+  // Form values → a clean row: empty fields are dropped, `max` only kept
+  // with a bar, and any key the form doesn't manage (hand-written YAML) is
+  // preserved.
+  _formToRow(v) {
+    const out = { entity: v.entity || "" };
+    for (const k of ["name", "attribute", "unit", "template"]) {
+      if (v[k] !== undefined && v[k] !== null && v[k] !== "") out[k] = v[k];
+    }
+    if (v.bar) {
+      out.bar = true;
+      if (v.max_source === "entity") {
+        if (v.max_entity) {
+          out.max_entity = v.max_entity;
+          if (v.max_attribute) out.max_attribute = v.max_attribute;
+        }
+      } else {
+        const m = Number(v.max);
+        if (v.max !== undefined && v.max !== null && v.max !== "" && Number.isFinite(m)) out.max = m;
+      }
+    }
+    const prev = this._customList()[this._view] || {};
+    for (const k of Object.keys(prev)) {
+      if (!CUSTOM_ROW_KEYS.includes(k)) out[k] = prev[k];
+    }
+    return out;
+  }
+
+  // `fromForm` rows come from the visual form, which tracks the maximum's
+  // source itself; code-view edits re-derive it from the row.
+  _applyRow(row, fromForm = false) {
+    if (this._view == null) return;
+    if (!fromForm) this._maxMode = null;
+    const list = [...this._customList()];
+    list[this._view] = row;
+    this._setCustom(list);
   }
 }
 
@@ -1851,7 +2760,7 @@ if (typeof window !== "undefined") {
     type: "pc-control-card",
     name: "PC Control Card",
     description:
-      "Tile, chip, or full feature card for controlling a PC (turn on / sleep / shutdown) with live CPU/RAM/GPU metrics.",
+      "Tile, chip, or full feature card for controlling a PC (turn on / sleep / shutdown) with live CPU/RAM/GPU metrics and custom rows.",
     preview: false,
   });
 
