@@ -76,15 +76,24 @@ test('confirm_restart arms on first press, fires on second', () => {
   card.disconnectedCallback();
 });
 
-test('restarting clears via the timeout fallback when the dip is never seen', () => {
+test('restarting keeps waiting when the dip is never seen before the timeout', () => {
   const card = nasCard();
   const base = (st) => ({ states: { 'binary_sensor.nas': { state: st, last_changed: new Date().toISOString(), attributes: {} } }, callService() {} });
   card.hass = base('on');
   card._onRestart();
   assert.equal(card._derivedStatus(), 'restarting');
-  // Simulate elapsed time beyond RESTART_TIMEOUT_MS (300s) without ever observing a dip.
-  card._pendingSince = Date.now() - 301_000;
-  card.hass = base('on');   // still on, never dipped
-  assert.equal(card._derivedStatus(), 'on');
+  assert.ok(card._pendingTimer);
+  card.disconnectedCallback();
+});
+
+test('timeout errors use alert styling on the whole card', () => {
+  const card = nasCard();
+  card.hass = onHass();
+  card._showActionError('restart_timeout');
+  card._update();
+  assert.equal(card._derivedStatus(), 'restart_timeout');
+  assert.match(card.shadowRoot.querySelector('.status .label').textContent, /Restart timeout/);
+  assert.equal(card.shadowRoot.querySelector('.card').classList.contains('action-error'), true);
+  assert.match(card.shadowRoot.querySelector('style').textContent, /spcCardError/);
   card.disconnectedCallback();
 });

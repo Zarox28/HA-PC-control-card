@@ -68,11 +68,11 @@ test('flat drives (no volumes) render health rows without grouping markers', () 
   card.disconnectedCallback();
 });
 
-test('show_drives:false hides the drive groups', () => {
+test('drive groups remain available when the legacy show_drives flag is false', () => {
   const card = featureCard({ show_drives: false });
   card.hass = groupedStates();
   const g0 = card.shadowRoot.querySelector('.drive-group[data-drive="0"]');
-  assert.equal(g0.style.display, 'none');
+  assert.equal(g0.style.display, '');
   card.disconnectedCallback();
 });
 
