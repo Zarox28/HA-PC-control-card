@@ -9,7 +9,7 @@
  *                 one bar per disk, custom rows) + uptime + 3 actions
  */
 
-const CARD_VERSION = "1.7.0";
+const CARD_VERSION = "1.7.1";
 
 // ── State machine ───────────────────────────────────────────────────
 //   off / on are derived from the binary_sensor.
@@ -836,8 +836,8 @@ const STYLES = `
 /* Graph (sparkline) in place of the bar. The viewBox is stretched to the row
    width, so the stroke is non-scaling to stay crisp and even. */
 .metric-graph {
+  position: relative;
   height: 36px; border-radius: 6px; overflow: hidden;
-  background: color-mix(in oklab, var(--spc-fg) 5%, var(--spc-bg));
 }
 .metric-graph svg { display: block; width: 100%; height: 100%; }
 .metric-graph .garea { fill: var(--spc-accent); fill-opacity: 0.16; stroke: none; }
@@ -847,6 +847,14 @@ const STYLES = `
   vector-effect: non-scaling-stroke;
 }
 .metric.has-graph .metric-head { margin-bottom: 6px; }
+/* Shown instead of a curve while there is nothing to draw (loading, no
+   history, history unavailable), so a graph row never looks broken. */
+.metric-graph .gempty {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; color: var(--spc-fg-2);
+}
+.metric-graph .gempty[hidden] { display: none; }
 .feature .actions {
   margin-top: auto;
   padding: 22px;
@@ -1279,7 +1287,10 @@ export class PcControlCard extends HTMLElementBase {
 
     const keys = new Set();
     for (const k of METRIC_KEYS) if (md[k] === "graph") keys.add(k);
-    if (md.storage === "graph") (this._storages || []).forEach((_, i) => keys.add(`storage_${i}`));
+    // A storage's own `display` wins over the `metrics_display.storage` default.
+    (this._storages || []).forEach((st, i) => {
+      if ((st.display ?? md.storage) === "graph") keys.add(`storage_${i}`);
+    });
     (this._customs || []).forEach((c, i) => c.display === "graph" && keys.add(`custom_${i}`));
     this._graphKeys = this._variant() === "feature" ? keys : new Set();
 
@@ -1418,6 +1429,12 @@ export class PcControlCard extends HTMLElementBase {
     setAttr(areaEl, "d", paths ? paths.area : "");
     const box = row.querySelector(".metric-graph");
     if (box) box.title = `Last ${this._graphHours} h`;
+    const emptyEl = row.querySelector(".gempty");
+    if (emptyEl) {
+      const msg = paths ? "" : g.failed ? "History unavailable" : g.fetchedAt ? "No history" : "Loading…";
+      emptyEl.hidden = !msg;
+      if (emptyEl.textContent !== msg) emptyEl.textContent = msg;
+    }
   }
 
   _clearGraph(row) {
@@ -1425,6 +1442,8 @@ export class PcControlCard extends HTMLElementBase {
     const areaEl = row.querySelector(".garea");
     if (lineEl) setAttr(lineEl, "d", "");
     if (areaEl) setAttr(areaEl, "d", "");
+    const emptyEl = row.querySelector(".gempty");
+    if (emptyEl) emptyEl.hidden = true;
   }
 
   // ── Action handlers ──────────────────────────────────────────
@@ -1969,6 +1988,8 @@ function normalizeStorageItem(s, i, base) {
     total: s.total || null,
     totalAttribute: s.total_attribute || null,
     unit: s.unit || null,
+    // Only meaningful for metrics.storages (drive volumes are always bars).
+    display: s.display === "graph" || s.display === "bar" ? s.display : null,
     name: s.name || (i === 0 ? base : `${base} ${i + 1}`),
   };
 }
@@ -1981,7 +2002,7 @@ function metricRow(key, label, nested, opts = {}) {
   const kind = opts.graph ? "graph" : opts.bar === false ? "none" : "bar";
   const viz =
     kind === "graph"
-      ? '<div class="metric-graph"><svg viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true"><path class="garea" d=""/><path class="gline" d=""/></svg></div>'
+      ? '<div class="metric-graph"><svg viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true"><path class="garea" d=""/><path class="gline" d=""/></svg><span class="gempty" hidden></span></div>'
       : kind === "bar"
         ? '<div class="metric-bar"><div class="fill"></div></div>'
         : "";
@@ -2079,6 +2100,17 @@ function setBtn(btn, opts) {
 const STORAGE_SLOTS = 3;
 const DRIVE_SLOTS = 4;
 
+// Bar or graph, for the Feature card (chip and tile only show values).
+const DISPLAY_SELECT = {
+  select: {
+    mode: "dropdown",
+    options: [
+      { value: "bar", label: "Progress bar" },
+      { value: "graph", label: "Graph" },
+    ],
+  },
+};
+
 const EDITOR_SCHEMA = [
   {
     name: "variant",
@@ -2150,30 +2182,6 @@ const EDITOR_SCHEMA = [
 
   {
     type: "expandable",
-    title: "Metric display (Feature)",
-    icon: "mdi:chart-areaspline",
-    schema: [
-      ...[...METRIC_KEYS, "storage"].map((k) => ({
-        name: `_display_${k}`,
-        selector: {
-          select: {
-            mode: "dropdown",
-            options: [
-              { value: "bar", label: "Progress bar" },
-              { value: "graph", label: "Graph" },
-            ],
-          },
-        },
-      })),
-      {
-        name: "graph_hours",
-        selector: { number: { min: 1, max: 720, step: 1, mode: "box", unit_of_measurement: "h" } },
-      },
-    ],
-  },
-
-  {
-    type: "expandable",
     title: "Appearance",
     icon: "mdi:palette",
     schema: [
@@ -2190,12 +2198,16 @@ const EDITOR_SCHEMA = [
     title: "Metrics (Chip & Feature)",
     icon: "mdi:chart-line",
     schema: [
-      { name: "_metric_cpu_usage", selector: { entity: { domain: "sensor" } } },
-      { name: "_metric_cpu_temp", selector: { entity: { domain: "sensor" } } },
-      { name: "_metric_gpu_usage", selector: { entity: { domain: "sensor" } } },
-      { name: "_metric_gpu_temp", selector: { entity: { domain: "sensor" } } },
-      { name: "_metric_ram_usage", selector: { entity: { domain: "sensor" } } },
-      { name: "_metric_ram_usage_total", selector: { entity: { domain: "sensor" } } },
+      // Each metric: its sensor, then how the Feature card draws it.
+      ...METRIC_KEYS.flatMap((k) => [
+        { name: `_metric_${k}`, selector: { entity: { domain: "sensor" } } },
+        ...(k === "ram_usage" ? [{ name: "_metric_ram_usage_total", selector: { entity: { domain: "sensor" } } }] : []),
+        { name: `_display_${k}`, selector: DISPLAY_SELECT },
+      ]),
+      {
+        name: "graph_hours",
+        selector: { number: { min: 1, max: 720, step: 1, mode: "box", unit_of_measurement: "h" } },
+      },
     ],
   },
 
@@ -2210,6 +2222,7 @@ const EDITOR_SCHEMA = [
       { name: "_storage_1_total_attribute", selector: { text: {} } },
       { name: "_storage_1_unit", selector: { text: {} } },
       { name: "_storage_1_name", selector: { text: {} } },
+      { name: "_storage_1_display", selector: DISPLAY_SELECT },
 
       { name: "_storage_2_entity", selector: { entity: { domain: "sensor" } } },
       { name: "_storage_2_attribute", selector: { text: {} } },
@@ -2217,6 +2230,7 @@ const EDITOR_SCHEMA = [
       { name: "_storage_2_total_attribute", selector: { text: {} } },
       { name: "_storage_2_unit", selector: { text: {} } },
       { name: "_storage_2_name", selector: { text: {} } },
+      { name: "_storage_2_display", selector: DISPLAY_SELECT },
 
       { name: "_storage_3_entity", selector: { entity: { domain: "sensor" } } },
       { name: "_storage_3_attribute", selector: { text: {} } },
@@ -2224,6 +2238,7 @@ const EDITOR_SCHEMA = [
       { name: "_storage_3_total_attribute", selector: { text: {} } },
       { name: "_storage_3_unit", selector: { text: {} } },
       { name: "_storage_3_name", selector: { text: {} } },
+      { name: "_storage_3_display", selector: DISPLAY_SELECT },
     ],
   },
 
@@ -2275,12 +2290,11 @@ const EDITOR_LABELS = {
   show_storage: "Show Storage",
   show_drives: "Show Drive health",
   show_custom_metrics: "Show Custom metrics",
-  _display_cpu_usage: "CPU usage · display",
-  _display_cpu_temp: "CPU temperature · display",
-  _display_gpu_usage: "GPU usage · display",
-  _display_gpu_temp: "GPU temperature · display",
-  _display_ram_usage: "RAM · display",
-  _display_storage: "Storage · display",
+  _display_cpu_usage: "CPU usage · display (bar or graph)",
+  _display_cpu_temp: "CPU temperature · display (bar or graph)",
+  _display_gpu_usage: "GPU usage · display (bar or graph)",
+  _display_gpu_temp: "GPU temperature · display (bar or graph)",
+  _display_ram_usage: "RAM · display (bar or graph)",
   graph_hours: "Graph period (hours, default 24)",
   accent_color: "Accent color (overrides theme)",
   icon: "Header icon",
@@ -2297,18 +2311,21 @@ const EDITOR_LABELS = {
   _storage_1_unit:
     "Disk 1 · unit the values are ALREADY in, e.g. MB (not the display unit — card auto-scales to GB/TB)",
   _storage_1_name: 'Disk 1 · label (e.g. "System")',
+  _storage_1_display: "Disk 1 · display (bar or graph)",
   _storage_2_entity: "Disk 2 · used / percent sensor",
   _storage_2_attribute: "Disk 2 · value attribute",
   _storage_2_total: "Disk 2 · total sensor",
   _storage_2_total_attribute: "Disk 2 · total attribute",
   _storage_2_unit: "Disk 2 · unit the values are ALREADY in, e.g. MB (auto-scales)",
   _storage_2_name: "Disk 2 · label",
+  _storage_2_display: "Disk 2 · display (bar or graph)",
   _storage_3_entity: "Disk 3 · used / percent sensor",
   _storage_3_attribute: "Disk 3 · value attribute",
   _storage_3_total: "Disk 3 · total sensor",
   _storage_3_total_attribute: "Disk 3 · total attribute",
   _storage_3_unit: "Disk 3 · unit the values are ALREADY in, e.g. MB (auto-scales)",
   _storage_3_name: "Disk 3 · label",
+  _storage_3_display: "Disk 3 · display (bar or graph)",
   _drive_1_status: "Drive 1 · status sensor",
   _drive_1_temp: "Drive 1 · temperature sensor",
   _drive_1_name: "Drive 1 · label",
@@ -2567,7 +2584,9 @@ class PcControlCardEditor extends HTMLElementBase {
     flat._metric_ram_usage_total = m.ram_usage_total;
     const md = migrated.metrics_display || {};
     delete flat.metrics_display;
-    for (const k of [...METRIC_KEYS, "storage"]) flat[`_display_${k}`] = md[k] === "graph" ? "graph" : "bar";
+    for (const k of METRIC_KEYS) flat[`_display_${k}`] = md[k] === "graph" ? "graph" : "bar";
+    // A disk with no `display` of its own follows `metrics_display.storage`.
+    const storageDefault = md.storage === "graph" ? "graph" : "bar";
 
     const storages = Array.isArray(m.storages) ? m.storages : [];
     for (let i = 0; i < STORAGE_SLOTS; i++) {
@@ -2578,6 +2597,7 @@ class PcControlCardEditor extends HTMLElementBase {
       flat[`_storage_${i + 1}_total_attribute`] = s.total_attribute;
       flat[`_storage_${i + 1}_unit`] = s.unit;
       flat[`_storage_${i + 1}_name`] = s.name;
+      flat[`_storage_${i + 1}_display`] = s.display === "graph" || s.display === "bar" ? s.display : storageDefault;
     }
 
     const drives = Array.isArray(migrated.drives) ? migrated.drives : [];
@@ -2604,10 +2624,14 @@ class PcControlCardEditor extends HTMLElementBase {
 
     // Only non-default displays are saved, so a stock config stays clean.
     const metricsDisplay = {};
-    for (const k of [...METRIC_KEYS, "storage"]) {
+    for (const k of METRIC_KEYS) {
       if (next[`_display_${k}`] === "graph") metricsDisplay[k] = "graph";
       delete next[`_display_${k}`];
     }
+    // `metrics_display.storage` (YAML-only default for every disk) is kept
+    // as is; a disk saves its own `display` only when it differs from it.
+    const storageDefault = this._config?.metrics_display?.storage === "graph" ? "graph" : "bar";
+    if (storageDefault === "graph") metricsDisplay.storage = "graph";
     if (Object.keys(metricsDisplay).length) next.metrics_display = metricsDisplay;
     else delete next.metrics_display;
     if (next.graph_hours === "" || next.graph_hours == null) delete next.graph_hours;
@@ -2622,6 +2646,8 @@ class PcControlCardEditor extends HTMLElementBase {
         if (next[`_storage_${i}_total_attribute`]) item.total_attribute = next[`_storage_${i}_total_attribute`];
         if (next[`_storage_${i}_unit`]) item.unit = next[`_storage_${i}_unit`];
         if (next[`_storage_${i}_name`]) item.name = next[`_storage_${i}_name`];
+        const disp = next[`_storage_${i}_display`];
+        if ((disp === "graph" || disp === "bar") && disp !== storageDefault) item.display = disp;
         storages.push(item);
       }
       delete next[`_storage_${i}_entity`];
@@ -2630,6 +2656,7 @@ class PcControlCardEditor extends HTMLElementBase {
       delete next[`_storage_${i}_total_attribute`];
       delete next[`_storage_${i}_unit`];
       delete next[`_storage_${i}_name`];
+      delete next[`_storage_${i}_display`];
     }
     if (storages.length) metrics.storages = storages;
     if (Object.keys(metrics).length) next.metrics = metrics;
