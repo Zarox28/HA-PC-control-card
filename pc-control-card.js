@@ -539,6 +539,8 @@ export function graphPaths(series, start, end, range, W = 100, H = 32) {
     clamp((t - start) / span, 0, 1) * W,
     clamp(H - inset - ((v - range.lo) / h) * (H - 2 * inset), inset, H - inset),
   ]);
+  // Anchor the first sample to the left edge, like the progress bar.
+  pts[0][0] = 0;
   const line = "M" + pts.map(([x, y]) => `${f(x)} ${f(y)}`).join(" L");
   const area = `${line} L${f(pts[pts.length - 1][0])} ${H} L${f(pts[0][0])} ${H} Z`;
   return { line, area };
@@ -837,7 +839,7 @@ const STYLES = `
    width, so the stroke is non-scaling to stay crisp and even. */
 .metric-graph {
   position: relative;
-  height: 36px; border-radius: 6px; overflow: hidden;
+  height: 32px; border-radius: 6px; overflow: hidden;
 }
 .metric-graph svg { display: block; width: 100%; height: 100%; }
 .metric-graph .garea { fill: var(--spc-accent); fill-opacity: 0.16; stroke: none; }
@@ -846,7 +848,7 @@ const STYLES = `
   stroke-linejoin: round; stroke-linecap: round;
   vector-effect: non-scaling-stroke;
 }
-.metric.has-graph .metric-head { margin-bottom: 6px; }
+.metric.has-graph .metric-head { margin-bottom: 5px; }
 /* Shown instead of a curve while there is nothing to draw (loading, no
    history, history unavailable), so a graph row never looks broken. */
 .metric-graph .gempty {
