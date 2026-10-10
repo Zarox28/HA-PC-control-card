@@ -9,16 +9,16 @@
  *                 one bar per disk, custom rows) + uptime + 3 actions
  */
 
-const CARD_VERSION = "1.7.2";
+const CARD_VERSION = "1.8.0";
 
 // ── State machine ───────────────────────────────────────────────────
 //   off / on are derived from the binary_sensor.
 //   booting / shutting / sleeping are local "pending" overlays that
 //   resolve when the sensor flips, or expire after a timeout.
 
-const PENDING_TIMEOUT_MS = 90_000;
-const RESTART_TIMEOUT_MS = 300_000; // NAS reboots are slower than a PC boot
+const PENDING_TIMEOUT_MS = 300_000;
 const SLEEP_DISPLAY_MS = 6_000;
+const ACTION_ERROR_DISPLAY_MS = 8_000;
 const ARM_TIMEOUT_MS = 2_400;
 
 // Graphs: number of points drawn, default period, refresh bounds.
@@ -36,6 +36,9 @@ const META = {
   shutting: { label: "Shutting down", tone: "alert", pulse: true },
   restarting: { label: "Restarting", tone: "warm", pulse: true },
   waking: { label: "Waking", tone: "warm", pulse: true },
+  boot_timeout: { label: "Boot timeout", tone: "alert", pulse: false },
+  shutdown_timeout: { label: "Shutdown timeout", tone: "alert", pulse: false },
+  restart_timeout: { label: "Restart timeout", tone: "alert", pulse: false },
 };
 
 // ── Metric registry ─────────────────────────────────────────────────
@@ -576,6 +579,20 @@ const STYLES = `
   box-shadow: var(--ha-card-box-shadow, 0 1px 2px rgba(0,0,0,0.03), 0 4px 16px -8px rgba(0,0,0,0.06));
   overflow: hidden;
   box-sizing: border-box;
+  position: relative;
+}
+.card.action-error {
+  border-color: var(--spc-alert);
+}
+.card.action-error::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 2px solid var(--spc-alert);
+  border-radius: inherit;
+  box-sizing: border-box;
+  pointer-events: none;
+  animation: spcCardError 1.6s ease-out infinite;
 }
 
 /* ── Atoms ─────────────────────────────────────────────────────── */
@@ -607,6 +624,11 @@ const STYLES = `
 @keyframes spcDots {
   0%, 20%   { width: 0; }
   100%      { width: 14px; }
+}
+@keyframes spcCardError {
+  0%   { box-shadow: inset 0 0 0 2px var(--spc-alert); opacity: 0.85; }
+  70%  { box-shadow: inset 0 0 0 8px transparent; opacity: 0.35; }
+  100% { box-shadow: inset 0 0 0 2px transparent; opacity: 0; }
 }
 
 .dots::after {
@@ -943,6 +965,9 @@ export class PcControlCard extends HTMLElementBase {
     this.attachShadow({ mode: "open" });
     this._pending = null; // 'on' | 'sleep' | 'restart' | 'shutdown'
     this._pendingSince = 0;
+    this._pendingTimer = null;
+    this._actionError = null;
+    this._actionErrorTimer = null;
     this._armed = { sleep: false, shutdown: false, restart: false };
     this._restartDipped = false;
     this._armTimers = {};
@@ -1000,16 +1025,17 @@ export class PcControlCard extends HTMLElementBase {
     // Clear pending overlay when the sensor confirms the action.
     if (this._pending && hass) {
       const s = hass.states[this._config.status_entity]?.state;
-      const elapsed = Date.now() - this._pendingSince;
       if (this._pending === "on" && s === "on") this._clearPending();
       if (this._pending === "shutdown" && s === "off") this._clearPending();
       if (this._pending === "restart") {
         // Reboot takes the box down (off/unavailable) then back to on.
         if (s !== "on") this._restartDipped = true;
         if (this._restartDipped && s === "on") this._clearPending();
-        if (elapsed > RESTART_TIMEOUT_MS) this._clearPending();
-      } else if (elapsed > PENDING_TIMEOUT_MS) {
-        this._clearPending();
+      }
+      if (this._actionError && ((this._actionError === "boot_timeout" && s === "on") ||
+        (this._actionError === "shutdown_timeout" && s === "off") ||
+        (this._actionError === "restart_timeout" && s === "on"))) {
+        this._clearActionError();
       }
     }
     this._update();
@@ -1055,12 +1081,15 @@ export class PcControlCard extends HTMLElementBase {
   disconnectedCallback() {
     Object.values(this._armTimers).forEach(clearTimeout);
     clearTimeout(this._sleepTimer);
+    clearTimeout(this._pendingTimer);
+    clearTimeout(this._actionErrorTimer);
     clearInterval(this._tickTimer);
   }
 
   // ── Derived status ────────────────────────────────────────────
   _derivedStatus() {
     const s = this._hass?.states[this._config.status_entity]?.state;
+    if (this._actionError) return this._actionError;
     if (this._pending === "on") return "booting";
     if (this._pending === "shutdown") return "shutting";
     if (this._pending === "restart") return "restarting";
@@ -1444,15 +1473,39 @@ export class PcControlCard extends HTMLElementBase {
   }
 
   _setPending(p) {
+    clearTimeout(this._pendingTimer);
+    this._clearActionError();
     this._pending = p;
     this._pendingSince = Date.now();
+    this._pendingTimer = setTimeout(() => {
+      if (this._pending === p) {
+        const error = p === "on" ? "boot_timeout" : `${p}_timeout`;
+        this._showActionError(error);
+        this._clearPending();
+        this._update();
+      }
+    }, PENDING_TIMEOUT_MS);
     this._update();
   }
   _clearPending() {
     this._pending = null;
     clearTimeout(this._sleepTimer);
+    clearTimeout(this._pendingTimer);
+    this._pendingTimer = null;
   }
-
+  _showActionError(error) {
+    clearTimeout(this._actionErrorTimer);
+    this._actionError = error;
+    this._actionErrorTimer = setTimeout(() => {
+      this._clearActionError();
+      this._update();
+    }, ACTION_ERROR_DISPLAY_MS);
+  }
+  _clearActionError() {
+    this._actionError = null;
+    clearTimeout(this._actionErrorTimer);
+    this._actionErrorTimer = null;
+  }
   _onTurnOn() {
     if (this._derivedStatus() === "on" || this._pending) return;
     // Bail before showing a pending overlay we'll never confirm.
@@ -1577,6 +1630,7 @@ export class PcControlCard extends HTMLElementBase {
     root.classList.toggle("is-on", status === "on");
     root.classList.toggle("is-sleeping", status === "sleeping");
     root.classList.toggle("is-off", status === "off");
+    root.classList.toggle("action-error", meta.tone === "alert" && !meta.pulse);
 
     // Track whether any action button is visible — used to collapse
     // the entire actions row + adjust the previous section's bottom
