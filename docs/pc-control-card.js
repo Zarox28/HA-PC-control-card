@@ -7,51 +7,9 @@
  *                 (CPU/GPU usage + temps, RAM, one row per disk, custom rows)
  *   - `feature` — full card with metric bars (CPU/GPU usage + temps, RAM,
  *                 one bar per disk, custom rows) + uptime + 3 actions
- *
- * Custom metrics (1.5+):
- *   `custom_metrics` is a free list of extra rows — a number or any text
- *   read from an entity state or attribute:
- *
- *     custom_metrics:
- *       - entity: sensor.node_updates
- *         name: Updates
- *         template: "{value} available"
- *       - entity: sensor.node_status
- *         name: Status
- *       - entity: sensor.node_info
- *         name: Version
- *         attribute: version
- *       - entity: sensor.node_disk_free
- *         name: Free
- *         unit: GB
- *         bar: true
- *         max: 500
- *       - entity: sensor.node_disk_used
- *         name: Used
- *         unit: GB
- *         template: "{value} / {max}"
- *         bar: true
- *         max_entity: sensor.node_disk_total
- *
- *   Fields: entity (required), name, attribute, unit, template
- *   ({value} and {max} placeholders), bar (progress bar, numeric values
- *   only) + its maximum, either a fixed `max` (default 100) or the state of
- *   a `max_entity` (optionally one of its `max_attribute`s, in the same unit
- *   as the value).
- *
- * Install:
- *   1. Save this file to `/config/www/pc-control-card.js`
- *   2. Settings → Dashboards → ⋮ → Resources → Add Resource
- *        URL: /local/pc-control-card.js
- *        Type: JavaScript Module
- *   3. Add the card via YAML (see README.md) or the visual editor
- *
- * Theme: follows HA's --card-background-color, --primary-text-color,
- *        --secondary-text-color, --divider-color, --primary-color,
- *        --error-color. Light & dark themes Just Work.
  */
 
-const CARD_VERSION = "1.6.0";
+const CARD_VERSION = "1.7.0";
 
 // ── State machine ───────────────────────────────────────────────────
 //   off / on are derived from the binary_sensor.
@@ -62,6 +20,13 @@ const PENDING_TIMEOUT_MS = 90_000;
 const RESTART_TIMEOUT_MS = 300_000; // NAS reboots are slower than a PC boot
 const SLEEP_DISPLAY_MS = 6_000;
 const ARM_TIMEOUT_MS = 2_400;
+
+// Graphs: number of points drawn, default period, refresh bounds.
+const GRAPH_POINTS = 48;
+const GRAPH_DEFAULT_HOURS = 24;
+const GRAPH_MIN_REFRESH_MS = 60_000;
+const GRAPH_MAX_REFRESH_MS = 900_000;
+const GRAPH_RETRY_MS = 30_000;
 
 const META = {
   off: { label: "Off", tone: "idle", pulse: false },
@@ -351,6 +316,17 @@ function toStrictNumber(raw) {
   return null;
 }
 
+// The maximum of a custom row: the positive number read from `maxEnt` (its
+// state or `maxAttribute`) when `maxEntity` is set — with NO fallback to
+// `max` if it can't be read — else the fixed `max`; null when neither.
+export function resolveCustomMax({ max = null, maxEntity = null, maxEnt = null, maxAttribute = null } = {}) {
+  if (maxEntity) {
+    const n = toStrictNumber(maxAttribute ? maxEnt?.attributes?.[maxAttribute] : maxEnt?.state);
+    return n != null && n > 0 ? n : null;
+  }
+  return Number.isFinite(max) && max > 0 ? max : null;
+}
+
 // Pure resolver for one custom metric row. Returns null when there's no
 // usable value (entity missing, unavailable/unknown, empty attribute).
 //
@@ -399,13 +375,7 @@ export function computeCustomDisplay(ent, opts = {}) {
   if (str === "") return null;
 
   // Bar maximum: from an entity (+ optional attribute) or a fixed number.
-  let maxN = null;
-  if (maxEntity) {
-    const n = toStrictNumber(maxAttribute ? maxEnt?.attributes?.[maxAttribute] : maxEnt?.state);
-    maxN = n != null && n > 0 ? n : null;
-  } else if (Number.isFinite(max) && max > 0) {
-    maxN = max;
-  }
+  const maxN = resolveCustomMax({ max, maxEntity, maxEnt, maxAttribute });
 
   const isNum = typeof raw === "number" ? Number.isFinite(raw) : NUMERIC_RE.test(str);
   let text;
@@ -433,6 +403,145 @@ export function computeCustomDisplay(ent, opts = {}) {
     displayValue = String(template).replace(/\{(value|max)\}/g, (_m, k) => (k === "value" ? text : maxText));
   }
   return { displayValue, compactValue: text, barPct };
+}
+
+// ── Graph helpers ───────────────────────────────────────────────────
+// Pure functions (no DOM, no hass) so they can be unit-tested under Node.
+
+// Top of a built-in metric's graph, mirroring computeMetricDisplay's modes:
+//   - total configured (separate entity / attribute) or explicit unit → that
+//     total, in the SOURCE unit (graph values aren't rescaled either)
+//   - plain percent mode → 100 when the unit is % (or none), else null
+//     (e.g. a °C sensor auto-scales — a 0–100 axis would flatten it)
+// null = auto-scale.
+export function computeMetricMax(ent, totalEnt, opts = {}) {
+  const { totalAttribute = null, totalConfigured = false, unit: unitOverride = null } = opts;
+  if (!ent) return null;
+  if (totalConfigured || unitOverride) {
+    const t = totalAttribute
+      ? parseFloat(ent.attributes?.[totalAttribute])
+      : totalEnt
+        ? parseFloat(totalEnt.state)
+        : NaN;
+    return Number.isFinite(t) && t > 0 ? t : null;
+  }
+  const u = ent.attributes?.unit_of_measurement ?? "";
+  return u === "%" || u === "" ? 100 : null;
+}
+
+// Numeric value of one history sample / current state, or null. Same source
+// rules as the row itself: an explicit attribute, else the state, else (for
+// HASS.Agent-style storage sensors) the UsedSpacePercentage attribute.
+// `strict` (custom rows) refuses "1.2.3"-style strings; built-in rows keep
+// parseFloat's leniency, like the bars.
+export function graphValue(state, attrs, opts = {}) {
+  const { attribute = null, autoDetect = false, strict = false } = opts;
+  const num = (x) => {
+    if (strict) return toStrictNumber(x);
+    const n = parseFloat(x);
+    return Number.isFinite(n) ? n : null;
+  };
+  if (attribute) return num(attrs?.[attribute]);
+  const v = num(state);
+  if (v != null) return v;
+  if (autoDetect) return num(attrs?.UsedSpacePercentage);
+  return null;
+}
+
+function toMs(x) {
+  if (typeof x === "number") return Number.isFinite(x) ? (x < 1e12 ? x * 1000 : x) : null;
+  if (typeof x === "string") {
+    const t = Date.parse(x);
+    return Number.isFinite(t) ? t : null;
+  }
+  return null;
+}
+
+// Decode the websocket history list for one entity into [[ms, value], …].
+// Handles the compressed format (s = state, a = attributes, lu/lc = epoch
+// seconds, lc only when it differs from lu) and the long REST-style keys.
+// Attributes are carried forward when a sample omits them. Samples without
+// a usable time or number (unavailable, text…) are dropped.
+export function parseHistoryPoints(list, opts = {}) {
+  const out = [];
+  let attrs = null;
+  for (const p of Array.isArray(list) ? list : []) {
+    if (!p || typeof p !== "object") continue;
+    if (p.a) attrs = p.a;
+    else if (p.attributes) attrs = p.attributes;
+    const t = toMs(p.lu ?? p.lc ?? p.last_updated ?? p.last_changed);
+    const v = graphValue(p.s ?? p.state, attrs, opts);
+    if (t != null && v != null) out.push([t, v]);
+  }
+  return out.sort((a, b) => a[0] - b[0]);
+}
+
+// Time-weighted resampling of a step series (a value holds until the next
+// change) into `n` equal buckets over [start, end]. Buckets before the first
+// known sample are skipped. A dense sensor therefore keeps its average shape
+// instead of aliasing on whichever sample lands on the bucket edge.
+export function resampleSeries(points, start, end, n = GRAPH_POINTS) {
+  const out = [];
+  if (!points.length || !(end > start) || n < 1) return out;
+  const step = (end - start) / n;
+  let i = 0;
+  for (let b = 0; b < n; b++) {
+    const b0 = start + b * step;
+    const b1 = b0 + step;
+    while (i + 1 < points.length && points[i + 1][0] <= b0) i++;
+    const known = points[i][0] <= b0;
+    let cur = known ? points[i][1] : null;
+    let k = known ? i + 1 : i;
+    let t = b0;
+    let acc = 0;
+    let covered = 0;
+    for (;;) {
+      const nextT = k < points.length && points[k][0] < b1 ? points[k][0] : b1;
+      if (cur != null) {
+        acc += cur * (nextT - t);
+        covered += nextT - t;
+      }
+      if (nextT >= b1) break;
+      t = nextT;
+      cur = points[k][1];
+      k++;
+    }
+    if (covered > 0) out.push([b0 + step / 2, acc / covered]);
+  }
+  return out;
+}
+
+// Vertical range of a graph. With a known maximum the axis is 0..max (grown
+// if the data exceeds it); otherwise it fits the data with 10% breathing room.
+export function graphRange(values, max = null) {
+  if (!values.length) return { lo: 0, hi: 1 };
+  const lo = Math.min(...values);
+  const hi = Math.max(...values);
+  if (max != null) return { lo: Math.min(0, lo), hi: Math.max(max, hi) };
+  if (lo === hi) {
+    const pad = Math.abs(lo) * 0.1 || 1;
+    return { lo: lo - pad, hi: hi + pad };
+  }
+  const pad = (hi - lo) * 0.1;
+  return { lo: lo - pad, hi: hi + pad };
+}
+
+// SVG path data for a [[ms, value], …] series in a W×H viewBox: a line and a
+// closed area under it. Needs ≥ 2 points, otherwise null.
+export function graphPaths(series, start, end, range, W = 100, H = 32) {
+  if (!series || series.length < 2) return null;
+  const span = end - start || 1;
+  const h = range.hi - range.lo || 1;
+  const inset = 2; // keeps the stroke from being clipped at the top/bottom
+  const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+  const f = (n) => Math.round(n * 100) / 100;
+  const pts = series.map(([t, v]) => [
+    clamp((t - start) / span, 0, 1) * W,
+    clamp(H - inset - ((v - range.lo) / h) * (H - 2 * inset), inset, H - inset),
+  ]);
+  const line = "M" + pts.map(([x, y]) => `${f(x)} ${f(y)}`).join(" L");
+  const area = `${line} L${f(pts[pts.length - 1][0])} ${H} L${f(pts[0][0])} ${H} Z`;
+  return { line, area };
 }
 
 // ── Styles ──────────────────────────────────────────────────────────
@@ -724,6 +833,20 @@ const STYLES = `
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .metric.no-bar .metric-head { margin-bottom: 0; }
+/* Graph (sparkline) in place of the bar. The viewBox is stretched to the row
+   width, so the stroke is non-scaling to stay crisp and even. */
+.metric-graph {
+  height: 36px; border-radius: 6px; overflow: hidden;
+  background: color-mix(in oklab, var(--spc-fg) 5%, var(--spc-bg));
+}
+.metric-graph svg { display: block; width: 100%; height: 100%; }
+.metric-graph .garea { fill: var(--spc-accent); fill-opacity: 0.16; stroke: none; }
+.metric-graph .gline {
+  fill: none; stroke: var(--spc-accent); stroke-width: 1.5;
+  stroke-linejoin: round; stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+.metric.has-graph .metric-head { margin-bottom: 6px; }
 .feature .actions {
   margin-top: auto;
   padding: 22px;
@@ -858,6 +981,7 @@ export class PcControlCard extends HTMLElementBase {
     this._storages = this._normalizeStorages();
     this._drives = this._normalizeDrives();
     this._customs = this._normalizeCustomMetrics();
+    this._initGraphs();
     this._healthyStates = (
       Array.isArray(this._config.healthy_states) && this._config.healthy_states.length
         ? this._config.healthy_states
@@ -1024,13 +1148,21 @@ export class PcControlCard extends HTMLElementBase {
       .filter((x) => x && typeof x.entity === "string" && x.entity)
       .map((x) => {
         const max = Number(x.max);
+        // `display` wins; the legacy `bar: true` still means a bar.
+        const display =
+          x.display === "bar" || x.display === "graph" || x.display === "none"
+            ? x.display
+            : x.bar === true
+              ? "bar"
+              : "none";
         return {
           entity: x.entity,
           name: x.name ? String(x.name) : null,
           attribute: x.attribute ? String(x.attribute) : null,
           unit: x.unit != null && x.unit !== "" ? String(x.unit) : null,
           template: x.template ? String(x.template) : null,
-          bar: x.bar === true,
+          display,
+          bar: display === "bar",
           // null = "not set" (the bar then defaults to 100; {max} shows "—")
           max: Number.isFinite(max) && max > 0 ? max : null,
           maxEntity: typeof x.max_entity === "string" && x.max_entity ? x.max_entity : null,
@@ -1069,21 +1201,40 @@ export class PcControlCard extends HTMLElementBase {
     return "—";
   }
 
+  // Where a built-in metric (or a storage / drive volume) reads its numbers
+  // from: { entityId, totalId, attribute, totalAttribute, unit, autoDetect }.
+  // Storage entries are keyed by index: 'storage_0', 'storage_1', … and may
+  // pull their value from an attribute; for HASS.Agent (non-numeric state)
+  // the value auto-detects from the UsedSpacePercentage attribute.
+  _metricSource(key) {
+    const m = this._config.metrics || {};
+    const fromItem = (s) =>
+      s && {
+        entityId: s.entity,
+        totalId: s.total,
+        attribute: s.attribute,
+        totalAttribute: s.totalAttribute,
+        unit: s.unit,
+        autoDetect: !s.attribute, // only fall back when no explicit attribute
+      };
+    if (key === "storage" || key.startsWith("storage_")) {
+      const idx = key === "storage" ? 0 : parseInt(key.slice(8), 10);
+      return fromItem(this._storages?.[idx]) || null;
+    }
+    if (key.startsWith("dvol_")) {
+      // dvol_<driveIdx>_<volumeIdx> — a volume nested under a drive.
+      const [, di, vi] = key.split("_");
+      return fromItem(this._drives?.[+di]?.volumes?.[+vi]) || null;
+    }
+    const plain = { totalId: null, attribute: null, totalAttribute: null, unit: null, autoDetect: false };
+    if (key === "ram_usage") return { ...plain, entityId: m.ram_usage, totalId: m.ram_usage_total };
+    return { ...plain, entityId: m[key] };
+  }
+
   // Resolve a metric entity (+ optional separate total entity) from hass
-  // and delegate the parsing/formatting to computeMetricDisplay. Storage
-  // entries are keyed by index: 'storage_0', 'storage_1', … and may pull
-  // their value from an attribute; for HASS.Agent (non-numeric state) the
-  // value auto-detects from the UsedSpacePercentage attribute. Custom
+  // and delegate the parsing/formatting to computeMetricDisplay. Custom
   // metrics ('custom_0', …) go through computeCustomDisplay instead.
   _metricValue(key) {
-    const m = this._config.metrics || {};
-    let entityId,
-      totalId,
-      attribute = null,
-      totalAttribute = null,
-      autoDetect = false,
-      unit = null;
-
     if (key.startsWith("custom_")) {
       const cm = this._customs?.[parseInt(key.slice(7), 10)];
       if (!cm) return null;
@@ -1102,47 +1253,178 @@ export class PcControlCard extends HTMLElementBase {
       });
     }
 
-    if (key === "storage" || key.startsWith("storage_")) {
-      const idx = key === "storage" ? 0 : parseInt(key.slice(8), 10);
-      const s = this._storages?.[idx];
-      if (!s) return null;
-      entityId = s.entity;
-      totalId = s.total;
-      attribute = s.attribute;
-      totalAttribute = s.totalAttribute;
-      unit = s.unit;
-      autoDetect = !s.attribute; // only fall back when no explicit attribute
-    } else if (key.startsWith("dvol_")) {
-      // dvol_<driveIdx>_<volumeIdx> — a volume nested under a drive.
-      const [, di, vi] = key.split("_");
-      const v = this._drives?.[+di]?.volumes?.[+vi];
-      if (!v) return null;
-      entityId = v.entity;
-      totalId = v.total;
-      attribute = v.attribute;
-      totalAttribute = v.totalAttribute;
-      unit = v.unit;
-      autoDetect = !v.attribute;
-    } else if (key === "ram_usage") {
-      entityId = m.ram_usage;
-      totalId = m.ram_usage_total;
-    } else {
-      entityId = m[key];
-      totalId = null;
-    }
-
-    if (!entityId) return null;
-    const ent = this._hass?.states[entityId];
+    const src = this._metricSource(key);
+    if (!src || !src.entityId) return null;
+    const ent = this._hass?.states[src.entityId];
     if (!ent) return null;
-    const totalEnt = totalId ? this._hass?.states[totalId] : null;
+    const totalEnt = src.totalId ? this._hass?.states[src.totalId] : null;
 
     return computeMetricDisplay(ent, totalEnt, {
-      attribute,
-      totalAttribute,
-      totalConfigured: !!totalAttribute || !!totalId,
-      autoDetect,
-      unit,
+      attribute: src.attribute,
+      totalAttribute: src.totalAttribute,
+      totalConfigured: !!src.totalAttribute || !!src.totalId,
+      autoDetect: src.autoDetect,
+      unit: src.unit,
     });
+  }
+
+  // ── Graphs ────────────────────────────────────────────────────
+  // Rows shown as a graph instead of a bar: built-ins via `metrics_display`
+  // (cpu_usage … ram_usage, `storage` = every storage row), custom rows via
+  // their own `display`. Feature variant only — chip shows values, tile none.
+  _initGraphs() {
+    const md = this._config.metrics_display || {};
+    const hours = Number(this._config.graph_hours);
+    this._graphHours = Number.isFinite(hours) && hours > 0 ? Math.min(720, hours) : GRAPH_DEFAULT_HOURS;
+
+    const keys = new Set();
+    for (const k of METRIC_KEYS) if (md[k] === "graph") keys.add(k);
+    if (md.storage === "graph") (this._storages || []).forEach((_, i) => keys.add(`storage_${i}`));
+    (this._customs || []).forEach((c, i) => c.display === "graph" && keys.add(`custom_${i}`));
+    this._graphKeys = this._variant() === "feature" ? keys : new Set();
+
+    // Keep already-loaded history across config edits when nothing relevant
+    // changed (the visual editor re-sets the config on every keystroke).
+    const prev = this._graphs || new Map();
+    this._graphs = new Map();
+    for (const k of this._graphKeys) {
+      const spec = this._graphSpec(k);
+      if (!spec) continue;
+      const sig = `${spec.entity}|${spec.attribute}|${this._graphHours}`;
+      const old = prev.get(k);
+      if (old && old.sig === sig) {
+        old.spec = spec;
+        this._graphs.set(k, old);
+      } else {
+        this._graphs.set(k, { sig, spec, points: [], fetchedAt: 0, loading: false, failed: false });
+      }
+    }
+  }
+
+  // What to fetch / how to read it for one graph row.
+  _graphSpec(key) {
+    if (key.startsWith("custom_")) {
+      const cm = this._customs?.[parseInt(key.slice(7), 10)];
+      if (!cm) return null;
+      return { entity: cm.entity, attribute: cm.attribute, autoDetect: false, strict: true, needAttrs: !!cm.attribute };
+    }
+    const src = this._metricSource(key);
+    if (!src?.entityId) return null;
+    return {
+      entity: src.entityId,
+      attribute: src.attribute,
+      autoDetect: src.autoDetect,
+      strict: false,
+      // attributes are only requested when the value may live in one
+      needAttrs: !!src.attribute || src.autoDetect,
+    };
+  }
+
+  // Long periods change slowly: refresh about twice per bucket, bounded.
+  _graphRefreshMs() {
+    const bucket = (this._graphHours * 3_600_000) / GRAPH_POINTS;
+    return Math.max(GRAPH_MIN_REFRESH_MS, Math.min(GRAPH_MAX_REFRESH_MS, bucket / 2));
+  }
+
+  _ensureGraphData(key) {
+    const g = this._graphs.get(key);
+    if (!g || g.loading || typeof this._hass?.callWS !== "function") return;
+    if (g.fetchedAt && Date.now() - g.fetchedAt < (g.failed ? GRAPH_RETRY_MS : this._graphRefreshMs())) return;
+    this._fetchGraph(g);
+  }
+
+  async _fetchGraph(g) {
+    g.loading = true;
+    const end = Date.now();
+    const start = end - this._graphHours * 3_600_000;
+    try {
+      const res = await this._hass.callWS({
+        type: "history/history_during_period",
+        start_time: new Date(start).toISOString(),
+        end_time: new Date(end).toISOString(),
+        entity_ids: [g.spec.entity],
+        include_start_time_state: true,
+        significant_changes_only: false,
+        minimal_response: !g.spec.needAttrs,
+        no_attributes: !g.spec.needAttrs,
+      });
+      g.points = parseHistoryPoints(res?.[g.spec.entity], g.spec);
+      g.failed = false;
+    } catch (_e) {
+      // Keep whatever we already had; retry soon.
+      g.failed = true;
+    }
+    g.fetchedAt = Date.now();
+    g.loading = false;
+    this._update();
+  }
+
+  // Current numeric value of a graph row, from the live state.
+  _graphLive(key) {
+    const spec = this._graphs.get(key)?.spec;
+    const ent = spec && this._hass?.states[spec.entity];
+    return ent ? graphValue(ent.state, ent.attributes, spec) : null;
+  }
+
+  // Top of the graph's axis (null = auto-scale to the data).
+  _graphMax(key) {
+    const states = this._hass?.states || {};
+    if (key.startsWith("custom_")) {
+      const cm = this._customs?.[parseInt(key.slice(7), 10)];
+      if (!cm) return null;
+      const mx = resolveCustomMax({
+        max: cm.max,
+        maxEntity: cm.maxEntity,
+        maxEnt: cm.maxEntity ? states[cm.maxEntity] : null,
+        maxAttribute: cm.maxAttribute,
+      });
+      if (mx != null || cm.maxEntity) return mx; // an explicit maximum, even if unreadable → auto
+      const unit = cm.unit ?? (cm.attribute ? "" : (states[cm.entity]?.attributes?.unit_of_measurement ?? ""));
+      return unit === "%" ? 100 : null;
+    }
+    const src = this._metricSource(key);
+    const ent = src && states[src.entityId];
+    if (!ent) return null;
+    return computeMetricMax(ent, src.totalId ? states[src.totalId] : null, {
+      totalAttribute: src.totalAttribute,
+      totalConfigured: !!src.totalAttribute || !!src.totalId,
+      unit: src.unit,
+    });
+  }
+
+  _drawGraph(row, key) {
+    const lineEl = row.querySelector(".gline");
+    const areaEl = row.querySelector(".garea");
+    const g = this._graphs.get(key);
+    if (!lineEl || !areaEl || !g) return;
+    this._ensureGraphData(key);
+
+    const end = Date.now();
+    const start = end - this._graphHours * 3_600_000;
+    const series = resampleSeries(g.points, start, end, GRAPH_POINTS);
+    const live = this._graphLive(key);
+    // The right edge is "now": pin it to the live value between refreshes.
+    if (live != null && series.length) series.push([end, live]);
+    const paths = graphPaths(
+      series,
+      start,
+      end,
+      graphRange(
+        series.map((p) => p[1]),
+        this._graphMax(key),
+      ),
+    );
+    setAttr(lineEl, "d", paths ? paths.line : "");
+    setAttr(areaEl, "d", paths ? paths.area : "");
+    const box = row.querySelector(".metric-graph");
+    if (box) box.title = `Last ${this._graphHours} h`;
+  }
+
+  _clearGraph(row) {
+    const lineEl = row.querySelector(".gline");
+    const areaEl = row.querySelector(".garea");
+    if (lineEl) setAttr(lineEl, "d", "");
+    if (areaEl) setAttr(areaEl, "d", "");
   }
 
   // ── Action handlers ──────────────────────────────────────────
@@ -1232,6 +1514,7 @@ export class PcControlCard extends HTMLElementBase {
       this._drives || [],
       headerIcon(this._config.icon),
       this._customs || [],
+      this._graphKeys || new Set(),
     );
     this.shadowRoot.innerHTML = `<style>${STYLES}</style>${html}`;
 
@@ -1363,13 +1646,16 @@ export class PcControlCard extends HTMLElementBase {
         if (k.startsWith("custom_")) this._syncCustomLabel(row.querySelector(".mlabel"), k);
         const m = this._metricValue(k);
         const valEl = row.querySelector(".mval");
-        const fillEl = row.querySelector(".fill"); // absent on bar-less custom rows
+        const fillEl = row.querySelector(".fill"); // absent on graph rows and bar-less custom rows
+        const asGraph = this._graphKeys?.has(k);
         if (isOn && m) {
           valEl.textContent = m.displayValue;
-          if (fillEl) fillEl.style.width = m.barPct != null ? `${m.barPct}%` : "0%";
+          if (asGraph) this._drawGraph(row, k);
+          else if (fillEl) fillEl.style.width = m.barPct != null ? `${m.barPct}%` : "0%";
         } else {
           valEl.textContent = "—";
-          if (fillEl) fillEl.style.width = "0%";
+          if (asGraph) this._clearGraph(row);
+          else if (fillEl) fillEl.style.width = "0%";
         }
       });
 
@@ -1629,7 +1915,7 @@ const TEMPLATES = {
     </ha-card>
   `,
 
-  feature: (storages, drives, iconSvg, customs = []) => `
+  feature: (storages, drives, iconSvg, customs = [], graphKeys = new Set()) => `
     <ha-card class="card feature">
       <div class="head">
         <div class="icon-box lg">${iconSvg}<span class="ring" style="display:none"></span></div>
@@ -1644,9 +1930,23 @@ const TEMPLATES = {
       </div>
 
       <div class="metrics${drives.some((d) => d.volumes && d.volumes.length) ? " has-drive-volumes" : ""}">
-        ${METRIC_KEYS.map((k) => metricRow(k, METRIC_LABELS[k])).join("")}
-        ${storages.map((s, i) => metricRow(`storage_${i}`, escapeHtml(s.name).toUpperCase())).join("")}
-        ${customs.map((c, i) => metricRow(`custom_${i}`, "", false, { custom: true, bar: c.bar })).join("")}
+        ${METRIC_KEYS.map((k) => metricRow(k, METRIC_LABELS[k], false, { graph: graphKeys.has(k) })).join("")}
+        ${storages
+          .map((s, i) =>
+            metricRow(`storage_${i}`, escapeHtml(s.name).toUpperCase(), false, {
+              graph: graphKeys.has(`storage_${i}`),
+            }),
+          )
+          .join("")}
+        ${customs
+          .map((c, i) =>
+            metricRow(`custom_${i}`, "", false, {
+              custom: true,
+              bar: c.display === "bar",
+              graph: graphKeys.has(`custom_${i}`),
+            }),
+          )
+          .join("")}
         ${drives.map((d, i) => driveGroup(d, i)).join("")}
       </div>
 
@@ -1674,17 +1974,24 @@ function normalizeStorageItem(s, i, base) {
 }
 
 // One metric row. `opts.custom` marks a custom-metric row (label filled in
-// at update time, free-text value styling); `opts.bar === false` omits the
-// progress bar entirely and tightens the row.
+// at update time, free-text value styling). The visual is a progress bar by
+// default; `opts.graph` swaps it for a sparkline and `opts.bar === false`
+// drops it entirely (value only).
 function metricRow(key, label, nested, opts = {}) {
-  const noBar = opts.bar === false;
+  const kind = opts.graph ? "graph" : opts.bar === false ? "none" : "bar";
+  const viz =
+    kind === "graph"
+      ? '<div class="metric-graph"><svg viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true"><path class="garea" d=""/><path class="gline" d=""/></svg></div>'
+      : kind === "bar"
+        ? '<div class="metric-bar"><div class="fill"></div></div>'
+        : "";
   return `
-    <div class="metric${nested ? " nested" : ""}${opts.custom ? " custom" : ""}${noBar ? " no-bar" : ""}" data-key="${key}">
+    <div class="metric${nested ? " nested" : ""}${opts.custom ? " custom" : ""}${kind === "none" ? " no-bar" : ""}${kind === "graph" ? " has-graph" : ""}" data-key="${key}">
       <div class="metric-head">
         <span class="mlabel">${label}</span>
         <span class="mval">—</span>
       </div>
-      ${noBar ? "" : '<div class="metric-bar"><div class="fill"></div></div>'}
+      ${viz}
     </div>
   `;
 }
@@ -1707,6 +2014,12 @@ function driveGroup(d, i) {
     .map((v, j) => metricRow(`dvol_${i}_${j}`, escapeHtml(v.name).toUpperCase(), true))
     .join("");
   return `<div class="drive-group" data-drive="${i}">${header}${vols}</div>`;
+}
+
+// setAttribute that skips the DOM write when nothing changed (graphs are
+// redrawn every second).
+function setAttr(el, name, value) {
+  if (el.getAttribute(name) !== value) el.setAttribute(name, value);
 }
 
 function escapeHtml(s) {
@@ -1837,6 +2150,30 @@ const EDITOR_SCHEMA = [
 
   {
     type: "expandable",
+    title: "Metric display (Feature)",
+    icon: "mdi:chart-areaspline",
+    schema: [
+      ...[...METRIC_KEYS, "storage"].map((k) => ({
+        name: `_display_${k}`,
+        selector: {
+          select: {
+            mode: "dropdown",
+            options: [
+              { value: "bar", label: "Progress bar" },
+              { value: "graph", label: "Graph" },
+            ],
+          },
+        },
+      })),
+      {
+        name: "graph_hours",
+        selector: { number: { min: 1, max: 720, step: 1, mode: "box", unit_of_measurement: "h" } },
+      },
+    ],
+  },
+
+  {
+    type: "expandable",
     title: "Appearance",
     icon: "mdi:palette",
     schema: [
@@ -1938,6 +2275,13 @@ const EDITOR_LABELS = {
   show_storage: "Show Storage",
   show_drives: "Show Drive health",
   show_custom_metrics: "Show Custom metrics",
+  _display_cpu_usage: "CPU usage · display",
+  _display_cpu_temp: "CPU temperature · display",
+  _display_gpu_usage: "GPU usage · display",
+  _display_gpu_temp: "GPU temperature · display",
+  _display_ram_usage: "RAM · display",
+  _display_storage: "Storage · display",
+  graph_hours: "Graph period (hours, default 24)",
   accent_color: "Accent color (overrides theme)",
   icon: "Header icon",
   _metric_cpu_usage: "CPU usage sensor (percent)",
@@ -1984,19 +2328,32 @@ const EDITOR_LABELS = {
 // Each list row is a single entity picker (like the official Entities card).
 const CUSTOM_ROW_SCHEMA = [{ name: "entity", required: true, selector: { entity: {} } }];
 
-// Sub-editor form. The maximum only makes sense — and only shows — with a
-// bar. `max_source` is a UI-only switch (never saved): a fixed value, or an
+// Sub-editor form. `display` picks value only / progress bar / graph. The
+// maximum only makes sense — and only shows — with a bar or a graph.
+// `max_source` is a UI-only switch (never saved): a fixed value, or an
 // entity (+ optional attribute) like the disks' `total`.
-function customRowSchema(withBar, maxMode) {
+function customRowSchema(display, maxMode) {
   const schema = [
     { name: "entity", required: true, selector: { entity: {} } },
     { name: "name", selector: { text: {} } },
     { name: "attribute", selector: { attribute: {} }, context: { filter_entity: "entity" } },
     { name: "unit", selector: { text: {} } },
     { name: "template", selector: { text: {} } },
-    { name: "bar", selector: { boolean: {} } },
+    {
+      name: "display",
+      selector: {
+        select: {
+          mode: "dropdown",
+          options: [
+            { value: "none", label: "Value only" },
+            { value: "bar", label: "Progress bar" },
+            { value: "graph", label: "Graph" },
+          ],
+        },
+      },
+    },
   ];
-  if (withBar) {
+  if (display === "bar" || display === "graph") {
     schema.push({
       name: "max_source",
       selector: {
@@ -2027,8 +2384,8 @@ const CUSTOM_ROW_LABELS = {
   attribute: "Attribute",
   unit: "Unit",
   template: "Template",
-  bar: "Progress bar",
-  max_source: "Bar maximum",
+  display: "Display",
+  max_source: "Maximum",
   max: "Maximum value",
   max_entity: "Maximum entity",
   max_attribute: "Maximum attribute",
@@ -2039,9 +2396,9 @@ const CUSTOM_ROW_HELPERS = {
   attribute: "Read an attribute instead of the state",
   unit: "Overrides the entity's unit (numeric values only)",
   template: 'Placeholders: {value} and {max}, e.g. "{value} / {max}"',
-  bar: "Numeric values only",
-  max_source: "What fills the bar completely",
-  max: "Default 100",
+  display: "Bar and graph need a numeric value (graphs also need the entity to be recorded)",
+  max_source: "Full scale of the bar / top of the graph",
+  max: "Bar default: 100 · graph default: auto-scale",
   max_entity: "Same unit as the value (e.g. a total-size sensor)",
   max_attribute: "Read an attribute instead of the state",
 };
@@ -2054,6 +2411,7 @@ const CUSTOM_ROW_KEYS = [
   "attribute",
   "unit",
   "template",
+  "display",
   "bar",
   "max",
   "max_entity",
@@ -2207,6 +2565,9 @@ class PcControlCardEditor extends HTMLElementBase {
     delete flat.custom_metrics;
     for (const k of METRIC_KEYS) flat[`_metric_${k}`] = m[k];
     flat._metric_ram_usage_total = m.ram_usage_total;
+    const md = migrated.metrics_display || {};
+    delete flat.metrics_display;
+    for (const k of [...METRIC_KEYS, "storage"]) flat[`_display_${k}`] = md[k] === "graph" ? "graph" : "bar";
 
     const storages = Array.isArray(m.storages) ? m.storages : [];
     for (let i = 0; i < STORAGE_SLOTS; i++) {
@@ -2240,6 +2601,16 @@ class PcControlCardEditor extends HTMLElementBase {
     }
     if (next._metric_ram_usage_total) metrics.ram_usage_total = next._metric_ram_usage_total;
     delete next._metric_ram_usage_total;
+
+    // Only non-default displays are saved, so a stock config stays clean.
+    const metricsDisplay = {};
+    for (const k of [...METRIC_KEYS, "storage"]) {
+      if (next[`_display_${k}`] === "graph") metricsDisplay[k] = "graph";
+      delete next[`_display_${k}`];
+    }
+    if (Object.keys(metricsDisplay).length) next.metrics_display = metricsDisplay;
+    else delete next.metrics_display;
+    if (next.graph_hours === "" || next.graph_hours == null) delete next.graph_hours;
 
     const storages = [];
     for (let i = 1; i <= STORAGE_SLOTS; i++) {
@@ -2630,13 +3001,14 @@ class PcControlCardEditor extends HTMLElementBase {
     if (mode === "gui") {
       const f = body.querySelector("ha-form");
       f.hass = this._hass;
-      // Swap the schema only when the bar toggle or the maximum source flips.
-      const withBar = !!item.bar;
+      // Swap the schema only when the display or the maximum source flips.
+      // A legacy `bar: true` row opens as "Progress bar".
+      const display = item.display === "bar" || item.display === "graph" ? item.display : item.bar ? "bar" : "none";
       const maxMode = this._maxMode ?? (item.max_entity ? "entity" : "value");
-      const schemaKey = `${withBar}|${maxMode}`;
+      const schemaKey = `${display}|${maxMode}`;
       if (f._schemaKey !== schemaKey) {
         f._schemaKey = schemaKey;
-        f.schema = customRowSchema(withBar, maxMode);
+        f.schema = customRowSchema(display, maxMode);
       }
       f.data = {
         entity: item.entity || "",
@@ -2644,7 +3016,7 @@ class PcControlCardEditor extends HTMLElementBase {
         attribute: item.attribute,
         unit: item.unit,
         template: item.template,
-        bar: withBar,
+        display,
         max_source: maxMode,
         max: item.max,
         max_entity: item.max_entity,
@@ -2711,8 +3083,8 @@ class PcControlCardEditor extends HTMLElementBase {
     for (const k of ["name", "attribute", "unit", "template"]) {
       if (v[k] !== undefined && v[k] !== null && v[k] !== "") out[k] = v[k];
     }
-    if (v.bar) {
-      out.bar = true;
+    if (v.display === "bar" || v.display === "graph") {
+      out.display = v.display;
       if (v.max_source === "entity") {
         if (v.max_entity) {
           out.max_entity = v.max_entity;
