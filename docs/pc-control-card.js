@@ -9,7 +9,7 @@
  *                 one bar per disk, custom rows) + uptime + 3 actions
  */
 
-const CARD_VERSION = "1.7.1";
+const CARD_VERSION = "1.7.2";
 
 // ── State machine ───────────────────────────────────────────────────
 //   off / on are derived from the binary_sensor.
@@ -968,18 +968,6 @@ export class PcControlCard extends HTMLElementBase {
       confirm_shutdown: true,
       confirm_sleep: false,
       confirm_restart: true,
-      show_turn_on: true,
-      show_sleep: true,
-      show_restart: false,
-      show_shutdown: true,
-      show_cpu_usage: true,
-      show_cpu_temp: false,
-      show_gpu_usage: true,
-      show_gpu_temp: false,
-      show_ram_usage: true,
-      show_storage: true,
-      show_drives: true,
-      show_custom_metrics: true,
       accent_color: null,
       healthy_states: null,
       icon: "pc",
@@ -1593,10 +1581,10 @@ export class PcControlCard extends HTMLElementBase {
     // padding so the card has equal side/bottom gaps when buttons are
     // hidden (behaves like a pure status monitor).
     const vis = {
-      on: this._config.show_turn_on !== false,
-      sleep: this._config.show_sleep !== false,
-      restart: !!this._config.show_restart,
-      shutdown: this._config.show_shutdown !== false,
+      on: !!this._actions.turn_on,
+      sleep: !!this._actions.sleep,
+      restart: !!this._actions.restart,
+      shutdown: !!this._actions.shutdown,
     };
     const anyBtn = vis.on || vis.sleep || vis.restart || vis.shutdown;
     root.classList.toggle("no-actions", !anyBtn);
@@ -1646,19 +1634,14 @@ export class PcControlCard extends HTMLElementBase {
       [...METRIC_KEYS, ...storageKeys, ...customKeys].forEach((k) => {
         const row = root.querySelector(`.metric[data-key="${k}"]`);
         if (!row) return;
-        // Hide the whole row when:
-        //  - cpu_usage/cpu_temp/gpu_*/ram_usage: no entity OR show_<k> is false
-        //  - storage_<i>: show_storage is false (entity always present
-        //    because we filter in _normalizeStorages)
-        //  - custom_<i>: show_custom_metrics is false (entity always
-        //    present, filtered in _normalizeCustomMetrics)
+        // Only configured metrics are rendered.
         let enabled;
         if (k.startsWith("storage_")) {
-          enabled = this._config.show_storage !== false;
+          enabled = true;
         } else if (k.startsWith("custom_")) {
-          enabled = this._config.show_custom_metrics !== false;
+          enabled = true;
         } else {
-          enabled = this._config[`show_${k}`] !== false && !!this._config.metrics?.[k];
+          enabled = !!this._config.metrics?.[k];
         }
         row.style.display = enabled ? "" : "none";
         if (!enabled) return;
@@ -1682,7 +1665,7 @@ export class PcControlCard extends HTMLElementBase {
       (this._drives || []).forEach((d, i) => {
         const row = root.querySelector(`.drive[data-key="drive_${i}"]`);
         if (!row) return;
-        const enabled = this._config.show_drives !== false;
+        const enabled = true;
         const group = root.querySelector(`.drive-group[data-drive="${i}"]`);
         (group || row).style.display = enabled ? "" : "none";
         if (!enabled) return;
@@ -1739,11 +1722,11 @@ export class PcControlCard extends HTMLElementBase {
         if (!stat) return;
         let enabled;
         if (k.startsWith("storage_")) {
-          enabled = this._config.show_storage !== false;
+          enabled = true;
         } else if (k.startsWith("custom_")) {
-          enabled = this._config.show_custom_metrics !== false;
+          enabled = true;
         } else {
-          enabled = this._config[`show_${k}`] !== false && !!this._config.metrics?.[k];
+          enabled = !!this._config.metrics?.[k];
         }
         stat.style.display = enabled ? "" : "none";
         if (!enabled) return;
@@ -1764,7 +1747,7 @@ export class PcControlCard extends HTMLElementBase {
       if ((this._drives || []).length) {
         const stat = mini.querySelector('.mini-stat[data-key="drives_summary"]');
         if (stat) {
-          const enabled = this._config.show_drives !== false;
+          const enabled = true;
           stat.style.display = enabled ? "" : "none";
           if (enabled) {
             anyMini = true;
@@ -2154,34 +2137,6 @@ const EDITOR_SCHEMA = [
 
   {
     type: "expandable",
-    title: "Visible buttons",
-    icon: "mdi:eye",
-    schema: [
-      { name: "show_turn_on", selector: { boolean: {} } },
-      { name: "show_sleep", selector: { boolean: {} } },
-      { name: "show_restart", selector: { boolean: {} } },
-      { name: "show_shutdown", selector: { boolean: {} } },
-    ],
-  },
-
-  {
-    type: "expandable",
-    title: "Visible metrics",
-    icon: "mdi:gauge",
-    schema: [
-      { name: "show_cpu_usage", selector: { boolean: {} } },
-      { name: "show_cpu_temp", selector: { boolean: {} } },
-      { name: "show_gpu_usage", selector: { boolean: {} } },
-      { name: "show_gpu_temp", selector: { boolean: {} } },
-      { name: "show_ram_usage", selector: { boolean: {} } },
-      { name: "show_storage", selector: { boolean: {} } },
-      { name: "show_drives", selector: { boolean: {} } },
-      { name: "show_custom_metrics", selector: { boolean: {} } },
-    ],
-  },
-
-  {
-    type: "expandable",
     title: "Appearance",
     icon: "mdi:palette",
     schema: [
@@ -2199,11 +2154,13 @@ const EDITOR_SCHEMA = [
     icon: "mdi:chart-line",
     schema: [
       // Each metric: its sensor, then how the Feature card draws it.
-      ...METRIC_KEYS.flatMap((k) => [
+      ...METRIC_KEYS.flatMap((k, index) => [
+        ...(index > 0 ? [{ name: `_metrics_divider_${k}`, type: "divider" }] : []),
         { name: `_metric_${k}`, selector: { entity: { domain: "sensor" } } },
         ...(k === "ram_usage" ? [{ name: "_metric_ram_usage_total", selector: { entity: { domain: "sensor" } } }] : []),
         { name: `_display_${k}`, selector: DISPLAY_SELECT },
       ]),
+      { name: "_metrics_divider_graph_period", type: "divider" },
       {
         name: "graph_hours",
         selector: { number: { min: 1, max: 720, step: 1, mode: "box", unit_of_measurement: "h" } },
@@ -2278,18 +2235,6 @@ const EDITOR_LABELS = {
   confirm_shutdown: "Require confirm for Shutdown",
   confirm_sleep: "Require confirm for Sleep",
   confirm_restart: "Require confirm for Restart",
-  show_turn_on: "Show Turn on button",
-  show_sleep: "Show Sleep button",
-  show_restart: "Show Restart button",
-  show_shutdown: "Show Shut down button",
-  show_cpu_usage: "Show CPU usage",
-  show_cpu_temp: "Show CPU temp",
-  show_gpu_usage: "Show GPU usage",
-  show_gpu_temp: "Show GPU temp",
-  show_ram_usage: "Show RAM",
-  show_storage: "Show Storage",
-  show_drives: "Show Drive health",
-  show_custom_metrics: "Show Custom metrics",
   _display_cpu_usage: "CPU usage · display (bar or graph)",
   _display_cpu_temp: "CPU temperature · display (bar or graph)",
   _display_gpu_usage: "GPU usage · display (bar or graph)",
