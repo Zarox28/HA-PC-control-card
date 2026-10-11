@@ -9,7 +9,7 @@
  *                 one bar per disk, custom rows) + uptime + 3 actions
  */
 
-const CARD_VERSION = "1.9.0";
+const CARD_VERSION = "1.9.1";
 
 // ── State machine ───────────────────────────────────────────────────
 //   off / on are derived from the binary_sensor.
@@ -688,10 +688,13 @@ const STYLES = `
 
 .icon-box {
   display: inline-flex; align-items: center; justify-content: center;
+  line-height: 0;
   flex-shrink: 0;
   transition: background 220ms, color 220ms;
   position: relative;
 }
+.icon-box > svg,
+.icon-box > ha-icon { display: block; }
 .header-icon {
   --mdc-icon-size: 22px;
   width: 22px;
@@ -733,10 +736,10 @@ const STYLES = `
 
 /* ── Chip variant (Mushroom-style) ────────────────────────────── */
 .chip .head {
-  display: flex; gap: 14px; padding: 18px; align-items: center;
+  display: flex; gap: 14px; padding: 18px; align-items: flex-start;
 }
 .chip .icon-box.chip-icon {
-  width: 52px; height: 52px; border-radius: 14px;
+  width: 44px; height: 44px; border-radius: 12px;
   background: color-mix(in oklab, var(--spc-fg) 8%, var(--spc-bg));
   color: var(--spc-fg-2);
 }
@@ -745,7 +748,7 @@ const STYLES = `
 .chip .head .meta { flex: 1; min-width: 0; }
 .chip .name { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
 .chip .status {
-  display: flex; align-items: center; gap: 6px; margin-top: 3px;
+  display: flex; align-items: center; gap: 6px; margin-top: 2px;
   font-size: 12.5px; color: var(--spc-fg-2);
 }
 .chip .status .uptime-sep { color: var(--spc-fg-2); opacity: 0.5; }
@@ -800,10 +803,16 @@ const STYLES = `
 .feature.is-on .icon-box.lg { background: var(--spc-accent); color: #fff; }
 .feature .head .meta { flex: 1; min-width: 0; }
 .feature .name { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
-.feature .status { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-size: 13px; font-weight: 500; }
+.feature .status { display: flex; align-items: center; gap: 8px; margin-top: 2px; font-size: 13px; font-weight: 500; }
 .feature .status .label { color: var(--spc-fg-2); }
-.feature .status.live  .label { color: var(--spc-accent); }
-.feature .status.warm  .label { color: var(--spc-warn); }
+.tile .status.live .label,
+.chip .status.live .label,
+.feature .status.live .label { color: var(--spc-accent); }
+.tile .status.warm .label,
+.chip .status.warm .label,
+.feature .status.warm .label { color: var(--spc-warn); }
+.tile .status.alert .label,
+.chip .status.alert .label,
 .feature .status.alert .label { color: var(--spc-alert); }
 .feature .uptime { text-align: right; min-width: 0; }
 .feature .uptime .ulabel {
@@ -1741,12 +1750,10 @@ export class PcControlCard extends HTMLElementBase {
         // Chip uses the compact form (no "/ total" suffix, no template) to
         // fit the narrower mini-stat column.
         cell.textContent = m ? m.compactValue : "—";
-        // Custom values are free text and may be ellipsized — keep the
-        // full templated text reachable as a tooltip.
         if (isCustom) cell.title = m ? m.displayValue : "";
       });
 
-      // Drives summary mini-stat (healthy/total), red if any unhealthy.
+      // Drive summary mini-stat (healthy/total), red if any unhealthy.
       if ((this._drives || []).length) {
         const stat = mini.querySelector('.mini-stat[data-key="drives_summary"]');
         if (stat) {
@@ -2662,8 +2669,7 @@ class PcControlCardEditor extends HTMLElementBase {
     const drives = this._config?.drives;
     if (Array.isArray(drives) && drives.length) {
       next.drives = drives.map(({ status, temp, name }) => ({ status, temp, name }));
-    }
-    else delete next.drives;
+    } else delete next.drives;
     return next;
   }
 
@@ -3074,7 +3080,6 @@ class PcControlCardEditor extends HTMLElementBase {
       const y = body.firstElementChild;
       if (y && "hass" in y) y.hass = this._hass;
     }
-
   }
 
   _buildSubForm() {
