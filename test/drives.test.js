@@ -79,7 +79,7 @@ test('drive rows render when drives are configured', () => {
     drives: [{ status: 'sensor.d1_status', name: 'Drive 1' }],
   });
   feat.hass = driveStates();
-  assert.equal(feat.shadowRoot.querySelector('.drive-group[data-drive="0"]').style.display, '');
+  assert.equal(feat.shadowRoot.querySelector('.drive[data-key="drive_0"]').style.display, '');
   feat.disconnectedCallback();
 
   const chip = document.createElement('pc-control-card');

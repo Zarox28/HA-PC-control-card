@@ -9,7 +9,7 @@
  *                 one bar per disk, custom rows) + uptime + 3 actions
  */
 
-const CARD_VERSION = "1.8.3";
+const CARD_VERSION = "1.9.0";
 
 // ── State machine ───────────────────────────────────────────────────
 //   off / on are derived from the binary_sensor.
@@ -157,8 +157,8 @@ function fmtNum(n) {
   return n.toFixed(2);
 }
 
-// Default set of drive/volume status states treated as healthy. Synology
-// reports "normal" for healthy disks and volumes. Overridable per card via
+// Default set of drive status states treated as healthy. Synology
+// reports "normal" for healthy disks. Overridable per card via
 // the `healthy_states` config key.
 export const DEFAULT_HEALTHY = ["normal", "ok", "healthy", "good"];
 
@@ -899,27 +899,6 @@ const STYLES = `
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-variant-numeric: tabular-nums;
 }
-/* Drive groups: a drive header + its nested volume bars. A thin inset
-   separator divides consecutive groups — it sits within the metrics'
-   side padding so it's narrower than the full-width action-footer
-   divider and the two read as different things. */
-.feature .drive-group { display: flex; flex-direction: column; gap: 8px; }
-/* Separator between drive groups — drawn as an inset line (16px of
-   breathing room each side) via ::before, so it reads as a group divider
-   and is clearly distinct from the full-width action-footer border. */
-.feature .metrics.has-drive-volumes .drive-group + .drive-group {
-  margin-top: 14px;
-  padding-top: 14px;
-  position: relative;
-}
-.feature .metrics.has-drive-volumes .drive-group + .drive-group::before {
-  content: "";
-  position: absolute;
-  top: 0; left: 16px; right: 16px;
-  height: 1px;
-  background: var(--spc-border);
-}
-.feature .drive-group .metric.nested { padding-left: 16px; }
 .chip .mini-stat .mval.bad { color: var(--spc-alert); }
 `;
 
@@ -994,6 +973,9 @@ export class PcControlCard extends HTMLElementBase {
       metrics: {},
       ...migrated,
     };
+    if (Array.isArray(this._config.drives)) {
+      this._config.drives = this._config.drives.map(({ status, temp, name }) => ({ status, temp, name }));
+    }
     this._storages = this._normalizeStorages();
     this._drives = this._normalizeDrives();
     this._customs = this._normalizeCustomMetrics();
@@ -1127,9 +1109,7 @@ export class PcControlCard extends HTMLElementBase {
   }
 
   // Normalize the optional top-level `drives` array into clean
-  // { status, temp, name, volumes } records — one per physical disk. A
-  // drive may carry nested `volumes` (same shape as metrics.storages);
-  // when present they render grouped under the drive in the feature card.
+  // { status, temp, name } records — one per physical disk.
   // Entries without a `status` sensor are dropped.
   _normalizeDrives() {
     const d = this._config.drives;
@@ -1140,9 +1120,6 @@ export class PcControlCard extends HTMLElementBase {
         status: x.status,
         temp: x.temp || null,
         name: x.name || (i === 0 ? "Drive" : `Drive ${i + 1}`),
-        volumes: Array.isArray(x.volumes)
-          ? x.volumes.filter((v) => v && v.entity).map((v, j) => normalizeStorageItem(v, j, "Volume"))
-          : [],
       }));
   }
 
@@ -1231,11 +1208,6 @@ export class PcControlCard extends HTMLElementBase {
     if (key === "storage" || key.startsWith("storage_")) {
       const idx = key === "storage" ? 0 : parseInt(key.slice(8), 10);
       return fromItem(this._storages?.[idx]) || null;
-    }
-    if (key.startsWith("dvol_")) {
-      // dvol_<driveIdx>_<volumeIdx> — a volume nested under a drive.
-      const [, di, vi] = key.split("_");
-      return fromItem(this._drives?.[+di]?.volumes?.[+vi]) || null;
     }
     const plain = { totalId: null, attribute: null, totalAttribute: null, unit: null, autoDetect: false };
     const item = m[key];
@@ -1708,13 +1680,12 @@ export class PcControlCard extends HTMLElementBase {
         }
       });
 
-      // Per-drive groups: health header + (optional) nested volume bars.
+      // Per-drive health rows.
       (this._drives || []).forEach((d, i) => {
         const row = root.querySelector(`.drive[data-key="drive_${i}"]`);
         if (!row) return;
         const enabled = true;
-        const group = root.querySelector(`.drive-group[data-drive="${i}"]`);
-        (group || row).style.display = enabled ? "" : "none";
+        row.style.display = enabled ? "" : "none";
         if (!enabled) return;
         const dot = row.querySelector(".ddot");
         const valEl = row.querySelector(".dval");
@@ -1727,21 +1698,6 @@ export class PcControlCard extends HTMLElementBase {
           dot.classList.remove("ok", "bad");
           valEl.textContent = "—";
         }
-        // Nested volume usage bars (rendered like storage bars).
-        (d.volumes || []).forEach((v, j) => {
-          const vrow = root.querySelector(`.metric[data-key="dvol_${i}_${j}"]`);
-          if (!vrow) return;
-          const mv = isOn ? this._metricValue(`dvol_${i}_${j}`) : null;
-          const valE = vrow.querySelector(".mval");
-          const fillE = vrow.querySelector(".fill");
-          if (isOn && mv) {
-            valE.textContent = mv.displayValue;
-            fillE.style.width = mv.barPct != null ? `${mv.barPct}%` : "0%";
-          } else {
-            valE.textContent = "—";
-            fillE.style.width = "0%";
-          }
-        });
       });
     }
 
@@ -1978,7 +1934,7 @@ const TEMPLATES = {
         </div>
       </div>
 
-      <div class="metrics${drives.some((d) => d.volumes && d.volumes.length) ? " has-drive-volumes" : ""}">
+      <div class="metrics">
         ${METRIC_KEYS.map((k) => metricRow(k, METRIC_LABELS[k], false, { graph: graphKeys.has(k) })).join("")}
         ${storages
           .map((s, i) =>
@@ -2009,8 +1965,7 @@ const TEMPLATES = {
   `,
 };
 
-// Normalize one storage/volume config record into the shape _metricValue
-// expects. Shared by metrics.storages and drives[].volumes.
+// Normalize one storage config record into the shape _metricValue expects.
 function normalizeStorageItem(s, i, base) {
   return {
     entity: s.entity,
@@ -2018,7 +1973,6 @@ function normalizeStorageItem(s, i, base) {
     total: s.total || null,
     totalAttribute: s.total_attribute || null,
     unit: s.unit || null,
-    // Only meaningful for metrics.storages (drive volumes are always bars).
     display: s.display === "graph" || s.display === "bar" ? s.display : null,
     name: s.name || (i === 0 ? base : `${base} ${i + 1}`),
   };
@@ -2057,14 +2011,9 @@ function driveRow(key, label) {
   `;
 }
 
-// A drive rendered as a group: its health header row, then any nested
-// volume usage bars beneath it. Used by the feature variant.
+// A drive rendered as a health row. Used by the feature variant.
 function driveGroup(d, i) {
-  const header = driveRow(`drive_${i}`, escapeHtml(d.name).toUpperCase());
-  const vols = (d.volumes || [])
-    .map((v, j) => metricRow(`dvol_${i}_${j}`, escapeHtml(v.name).toUpperCase(), true))
-    .join("");
-  return `<div class="drive-group" data-drive="${i}">${header}${vols}</div>`;
+  return driveRow(`drive_${i}`, escapeHtml(d.name).toUpperCase());
 }
 
 // setAttribute that skips the DOM write when nothing changed (graphs are
@@ -2119,16 +2068,12 @@ function setBtn(btn, opts) {
 // the HA frontend; outside HA (e.g. on the GitHub Pages demo) this
 // class is unused.
 //
-// Custom metrics get a dedicated list modelled on the official Entities
-// card editor: drag handle · entity picker · remove · edit (pencil), an
-// "Add entity" button, and a sub-editor (back arrow, `{}` code toggle) for
-// the per-row fields. Reordering is a small native pointer-events drag
-// (no dependency on HA's lazy-loaded SortableJS), so it works on touch too.
-
-// How many storage slots the visual editor exposes. The card itself
-// accepts any number via YAML; this only caps the visible form fields.
-const STORAGE_SLOTS = 3;
-const DRIVE_SLOTS = 4;
+// Storage, custom metrics and drives get
+// dedicated dynamic lists modelled on the official Entities card editor:
+// drag handle · entity picker · remove · edit (pencil), an "Add" button,
+// and a sub-editor (back arrow, `{}` code toggle) for the per-row fields.
+// Reordering is a small native pointer-events drag (no dependency on HA's
+// lazy-loaded SortableJS), so it works on touch too.
 
 // Bar or graph, for the Feature card (chip and tile only show values).
 const DISPLAY_SELECT = {
@@ -2213,60 +2158,6 @@ const EDITOR_SCHEMA = [
       ]),
     ],
   },
-
-  {
-    type: "expandable",
-    title: "Storage (multi-disk)",
-    icon: "mdi:harddisk",
-    schema: [
-      { name: "_storage_1_entity", selector: { entity: { domain: "sensor" } } },
-      { name: "_storage_1_attribute", selector: { text: {} } },
-      { name: "_storage_1_total", selector: { entity: { domain: "sensor" } } },
-      { name: "_storage_1_total_attribute", selector: { text: {} } },
-      { name: "_storage_1_unit", selector: { text: {} } },
-      { name: "_storage_1_name", selector: { text: {} } },
-      { name: "_storage_1_display", selector: DISPLAY_SELECT },
-
-      { name: "_storage_2_entity", selector: { entity: { domain: "sensor" } } },
-      { name: "_storage_2_attribute", selector: { text: {} } },
-      { name: "_storage_2_total", selector: { entity: { domain: "sensor" } } },
-      { name: "_storage_2_total_attribute", selector: { text: {} } },
-      { name: "_storage_2_unit", selector: { text: {} } },
-      { name: "_storage_2_name", selector: { text: {} } },
-      { name: "_storage_2_display", selector: DISPLAY_SELECT },
-
-      { name: "_storage_3_entity", selector: { entity: { domain: "sensor" } } },
-      { name: "_storage_3_attribute", selector: { text: {} } },
-      { name: "_storage_3_total", selector: { entity: { domain: "sensor" } } },
-      { name: "_storage_3_total_attribute", selector: { text: {} } },
-      { name: "_storage_3_unit", selector: { text: {} } },
-      { name: "_storage_3_name", selector: { text: {} } },
-      { name: "_storage_3_display", selector: DISPLAY_SELECT },
-    ],
-  },
-
-  {
-    type: "expandable",
-    title: "Drives (NAS health)",
-    icon: "mdi:harddisk-plus",
-    schema: [
-      { name: "_drive_1_status", selector: { entity: { domain: "sensor" } } },
-      { name: "_drive_1_temp", selector: { entity: { domain: "sensor" } } },
-      { name: "_drive_1_name", selector: { text: {} } },
-
-      { name: "_drive_2_status", selector: { entity: { domain: "sensor" } } },
-      { name: "_drive_2_temp", selector: { entity: { domain: "sensor" } } },
-      { name: "_drive_2_name", selector: { text: {} } },
-
-      { name: "_drive_3_status", selector: { entity: { domain: "sensor" } } },
-      { name: "_drive_3_temp", selector: { entity: { domain: "sensor" } } },
-      { name: "_drive_3_name", selector: { text: {} } },
-
-      { name: "_drive_4_status", selector: { entity: { domain: "sensor" } } },
-      { name: "_drive_4_temp", selector: { entity: { domain: "sensor" } } },
-      { name: "_drive_4_name", selector: { text: {} } },
-    ],
-  },
 ];
 
 const EDITOR_LABELS = {
@@ -2295,40 +2186,6 @@ const EDITOR_LABELS = {
   _metric_gpu_temp: "GPU temperature sensor (°C)",
   _metric_ram_usage: "RAM sensor (used / percent)",
   _metric_ram_usage_total: "RAM total sensor (omit to show percent only)",
-  _storage_1_entity: "Disk 1 · used / percent sensor",
-  _storage_1_attribute: "Disk 1 · value attribute (e.g. UsedSpacePercentage — leave blank to use state)",
-  _storage_1_total: "Disk 1 · total sensor (omit for percent display)",
-  _storage_1_total_attribute: "Disk 1 · total attribute on the same entity (e.g. TotalSizeMB)",
-  _storage_1_unit:
-    "Disk 1 · unit the values are ALREADY in, e.g. MB (not the display unit — card auto-scales to GB/TB)",
-  _storage_1_name: 'Disk 1 · label (e.g. "System")',
-  _storage_1_display: "Disk 1 · display (bar or graph)",
-  _storage_2_entity: "Disk 2 · used / percent sensor",
-  _storage_2_attribute: "Disk 2 · value attribute",
-  _storage_2_total: "Disk 2 · total sensor",
-  _storage_2_total_attribute: "Disk 2 · total attribute",
-  _storage_2_unit: "Disk 2 · unit the values are ALREADY in, e.g. MB (auto-scales)",
-  _storage_2_name: "Disk 2 · label",
-  _storage_2_display: "Disk 2 · display (bar or graph)",
-  _storage_3_entity: "Disk 3 · used / percent sensor",
-  _storage_3_attribute: "Disk 3 · value attribute",
-  _storage_3_total: "Disk 3 · total sensor",
-  _storage_3_total_attribute: "Disk 3 · total attribute",
-  _storage_3_unit: "Disk 3 · unit the values are ALREADY in, e.g. MB (auto-scales)",
-  _storage_3_name: "Disk 3 · label",
-  _storage_3_display: "Disk 3 · display (bar or graph)",
-  _drive_1_status: "Drive 1 · status sensor",
-  _drive_1_temp: "Drive 1 · temperature sensor",
-  _drive_1_name: "Drive 1 · label",
-  _drive_2_status: "Drive 2 · status sensor",
-  _drive_2_temp: "Drive 2 · temperature sensor",
-  _drive_2_name: "Drive 2 · label",
-  _drive_3_status: "Drive 3 · status sensor",
-  _drive_3_temp: "Drive 3 · temperature sensor",
-  _drive_3_name: "Drive 3 · label",
-  _drive_4_status: "Drive 4 · status sensor",
-  _drive_4_temp: "Drive 4 · temperature sensor",
-  _drive_4_name: "Drive 4 · label",
 };
 
 // ── Custom metrics editor: schemas, labels, icons ───────────────────
@@ -2529,15 +2386,209 @@ textarea.json {
 textarea.json.invalid { border-color: var(--error-color, #db4437); }
 `;
 
+// ── Dynamic list editors ────────────────────────────────────────────
+// Storage, custom metrics and drives are all
+// edited the same way: a list of rows (drag handle · picker · remove ·
+// pencil), an "Add" button and a per-row sub-editor. LIST_DEFS describes a
+// list, SUB_DEFS the sub-editor form of one row.
+
+const SENSOR_SELECTOR = { entity: { domain: "sensor" } };
+
+function listDef(def) {
+  return { ...def, rowSchema: [{ name: def.key, required: true, selector: def.selector }] };
+}
+
+const LIST_DEFS = {
+  storages: listDef({
+    title: "Storage",
+    hint: "One bar (or graph) per disk, for the Chip &amp; Feature variants. Pick the sensor, then use the pencil to set a name, a value attribute, a total, a unit or a graph.",
+    addLabel: "Add storage",
+    key: "entity",
+    pickerLabel: "Used / percent sensor",
+    selector: SENSOR_SELECTOR,
+  }),
+  custom: listDef({
+    title: "Custom metrics",
+    hint: "Extra rows for the Chip &amp; Feature variants. Pick an entity, then use the pencil to set a name, attribute, unit, <code>{value}</code> template or a progress bar.",
+    addLabel: "Add entity",
+    key: "entity",
+    pickerLabel: "Entity",
+    selector: { entity: {} },
+  }),
+  drives: listDef({
+    title: "Drives (NAS health)",
+    hint: "One row per physical drive: the Feature card shows each one, the Chip a healthy/total summary. Pick the status sensor, then use the pencil for a temperature sensor and a name.",
+    addLabel: "Add drive",
+    key: "status",
+    pickerLabel: "Status sensor",
+    selector: SENSOR_SELECTOR,
+  }),
+};
+
+// Lists shown on the main view, in the order the Feature card draws them.
+const MAIN_LISTS = ["storages", "custom", "drives"];
+
+// Pre-1.9 single-disk shorthand (metrics.storage + metrics.storage_*). The
+// card still reads it; the editor surfaces it as one row of the Storage list
+// and drops it as soon as that list is edited.
+const LEGACY_STORAGE_KEYS = [
+  "storage",
+  "storage_attribute",
+  "storage_total",
+  "storage_total_attribute",
+  "storage_unit",
+  "storage_name",
+];
+
+function legacyStorages(m) {
+  if (!m || !m.storage) return [];
+  const item = { entity: m.storage };
+  if (m.storage_name) item.name = m.storage_name;
+  if (m.storage_attribute) item.attribute = m.storage_attribute;
+  if (m.storage_total) item.total = m.storage_total;
+  if (m.storage_total_attribute) item.total_attribute = m.storage_total_attribute;
+  if (m.storage_unit) item.unit = m.storage_unit;
+  return [item];
+}
+
+const isFilled = (x) => x !== undefined && x !== null && x !== "";
+function copyFilled(out, src, keys) {
+  for (const k of keys) if (isFilled(src[k])) out[k] = src[k];
+  return out;
+}
+
+// Sub-editor of a storage item.
+function storageSubDef({ title, base, withDisplay }) {
+  const textKeys = ["name", "attribute", "total", "total_attribute", "unit"];
+  return {
+    title,
+    keys: ["entity", ...textKeys, ...(withDisplay ? ["display"] : [])],
+    labels: {
+      entity: "Used / percent sensor",
+      name: "Name",
+      attribute: "Value attribute",
+      total: "Total sensor",
+      total_attribute: "Total attribute",
+      unit: "Unit",
+      display: "Display",
+    },
+    helpers: {
+      name: `Defaults to "${base}", "${base} 2"…`,
+      attribute: "Read this attribute instead of the state (e.g. UsedSpacePercentage). Blank = state",
+      total: "Optional — omit for a percent display",
+      total_attribute: "Optional — total read from an attribute of the same entity (e.g. TotalSizeMB)",
+      unit: "Unit the values are ALREADY in, e.g. MB (not the display unit — the card auto-scales to GB/TB)",
+      display: "Progress bar or graph (Feature card)",
+    },
+    schemaKey: () => "static",
+    schema: () => [
+      { name: "entity", required: true, selector: SENSOR_SELECTOR },
+      { name: "name", selector: { text: {} } },
+      { name: "attribute", selector: { attribute: {} }, context: { filter_entity: "entity" } },
+      { name: "total", selector: SENSOR_SELECTOR },
+      { name: "total_attribute", selector: { attribute: {} }, context: { filter_entity: "entity" } },
+      { name: "unit", selector: { text: {} } },
+      ...(withDisplay ? [{ name: "display", selector: DISPLAY_SELECT }] : []),
+    ],
+    toForm: (item) => ({
+      entity: item.entity || "",
+      name: item.name,
+      attribute: item.attribute,
+      total: item.total,
+      total_attribute: item.total_attribute,
+      unit: item.unit,
+      ...(withDisplay ? { display: item.display === "graph" ? "graph" : "bar" } : {}),
+    }),
+    fromForm: (v) => {
+      const out = copyFilled({ entity: v.entity || "" }, v, textKeys);
+      if (withDisplay && v.display === "graph") out.display = "graph";
+      return out;
+    },
+  };
+}
+
+// `ui` = { maxMode } — the UI-only "fixed value / entity" switch of the
+// custom-metric maximum (only used by the custom sub-editor).
+const SUB_DEFS = {
+  storages: storageSubDef({ title: "Storage editor", base: "Disk", withDisplay: true }),
+
+  drives: {
+    title: "Drive editor",
+    keys: ["status", "temp", "name"],
+    labels: { status: "Status sensor", temp: "Temperature sensor", name: "Name" },
+    helpers: {
+      status: "Healthy when its state is normal / ok / healthy / good (see healthy_states)",
+      temp: "Optional — shown instead of the status text",
+      name: 'Defaults to "Drive", "Drive 2"…',
+    },
+    schemaKey: () => "static",
+    schema: () => [
+      { name: "status", required: true, selector: SENSOR_SELECTOR },
+      { name: "temp", selector: SENSOR_SELECTOR },
+      { name: "name", selector: { text: {} } },
+    ],
+    toForm: (item) => ({ status: item.status || "", temp: item.temp, name: item.name }),
+    fromForm: (v) => copyFilled({ status: v.status || "" }, v, ["temp", "name"]),
+  },
+
+  custom: {
+    title: "Custom metric editor",
+    keys: CUSTOM_ROW_KEYS,
+    labels: CUSTOM_ROW_LABELS,
+    helpers: CUSTOM_ROW_HELPERS,
+    // A legacy `bar: true` row opens as "Progress bar".
+    display: (item) => (item.display === "bar" || item.display === "graph" ? item.display : item.bar ? "bar" : "none"),
+    // The schema changes only when the display or the maximum source flips.
+    schemaKey(item, ui) {
+      return `${this.display(item)}|${ui.maxMode}`;
+    },
+    schema(item, ui) {
+      return customRowSchema(this.display(item), ui.maxMode);
+    },
+    toForm(item, ui) {
+      return {
+        entity: item.entity || "",
+        name: item.name,
+        attribute: item.attribute,
+        unit: item.unit,
+        template: item.template,
+        display: this.display(item),
+        max_source: ui.maxMode,
+        max: item.max,
+        max_entity: item.max_entity,
+        max_attribute: item.max_attribute,
+      };
+    },
+    // Empty fields are dropped and the maximum only kept with a bar / graph.
+    fromForm(v) {
+      const out = copyFilled({ entity: v.entity || "" }, v, ["name", "attribute", "unit", "template"]);
+      if (v.display === "bar" || v.display === "graph") {
+        out.display = v.display;
+        if (v.max_source === "entity") {
+          if (v.max_entity) {
+            out.max_entity = v.max_entity;
+            if (v.max_attribute) out.max_attribute = v.max_attribute;
+          }
+        } else if (isFilled(v.max) && Number.isFinite(Number(v.max))) {
+          out.max = Number(v.max);
+        }
+      }
+      return out;
+    },
+  },
+};
+
 class PcControlCardEditor extends HTMLElementBase {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
-    this._view = null; // null = main view · number = index of the custom row being edited
+    // null = main view · { kind, i } = sub-editor of row i of a list
+    // (kind: storages | custom | drives).
+    this._view = null;
     this._yaml = false; // sub-editor shows the code view
-    this._maxMode = null; // sub-editor: "value" | "entity" while picking the bar maximum (null = derive from the row)
-    this._adding = false; // main view shows the "add entity" picker
-    this._mounted = null; // "main" | "sub" — which skeleton is in the shadow DOM
+    this._maxMode = null; // custom sub-editor: "value" | "entity" while picking the maximum (null = derive from the row)
+    this._adding = new Set(); // lists currently showing their "add" picker
+    this._mounted = null; // key of the view whose skeleton is in the shadow DOM
   }
 
   setConfig(config) {
@@ -2561,38 +2612,20 @@ class PcControlCardEditor extends HTMLElementBase {
     return [...this.shadowRoot.querySelectorAll("ha-form, ha-yaml-editor")];
   }
 
-  // Flatten metrics.* → _metric_* and metrics.storages[] → _storage_N_*
-  // so the form has one field per row.
+  // Flatten metrics.<metric> → _metric_* so the main form has one field per
+  // row. Storage, custom metrics and drives are NOT part of the form: they
+  // are owned by the list UI below it.
   _flatten(config) {
     const migrated = config || {};
     const m = migrated.metrics || {};
     const flat = { ...migrated };
     delete flat.metrics;
+    delete flat.drives;
     for (const k of METRIC_KEYS) {
       const item = m[k] || {};
       flat[`_metric_${k}`] = item.entity;
       flat[`_display_${k}`] = item.display === "graph" ? "graph" : "bar";
       if (k === "ram_usage") flat._metric_ram_usage_total = item.total;
-    }
-
-    const storages = Array.isArray(m.storages) ? m.storages : [];
-    for (let i = 0; i < STORAGE_SLOTS; i++) {
-      const s = storages[i] || {};
-      flat[`_storage_${i + 1}_entity`] = s.entity;
-      flat[`_storage_${i + 1}_attribute`] = s.attribute;
-      flat[`_storage_${i + 1}_total`] = s.total;
-      flat[`_storage_${i + 1}_total_attribute`] = s.total_attribute;
-      flat[`_storage_${i + 1}_unit`] = s.unit;
-      flat[`_storage_${i + 1}_name`] = s.name;
-      flat[`_storage_${i + 1}_display`] = s.display === "graph" || s.display === "bar" ? s.display : "bar";
-    }
-
-    const drives = Array.isArray(migrated.drives) ? migrated.drives : [];
-    for (let i = 0; i < DRIVE_SLOTS; i++) {
-      const d = drives[i] || {};
-      flat[`_drive_${i + 1}_status`] = d.status;
-      flat[`_drive_${i + 1}_temp`] = d.temp;
-      flat[`_drive_${i + 1}_name`] = d.name;
     }
     return flat;
   }
@@ -2614,66 +2647,27 @@ class PcControlCardEditor extends HTMLElementBase {
     delete next._metric_ram_usage_total;
     if (next.graph_hours === "" || next.graph_hours == null) delete next.graph_hours;
 
-    const storages = [];
-    for (let i = 1; i <= STORAGE_SLOTS; i++) {
-      const entity = next[`_storage_${i}_entity`];
-      if (entity) {
-        const item = { entity };
-        if (next[`_storage_${i}_attribute`]) item.attribute = next[`_storage_${i}_attribute`];
-        if (next[`_storage_${i}_total`]) item.total = next[`_storage_${i}_total`];
-        if (next[`_storage_${i}_total_attribute`]) item.total_attribute = next[`_storage_${i}_total_attribute`];
-        if (next[`_storage_${i}_unit`]) item.unit = next[`_storage_${i}_unit`];
-        if (next[`_storage_${i}_name`]) item.name = next[`_storage_${i}_name`];
-        const disp = next[`_storage_${i}_display`];
-        if (disp === "graph") item.display = disp;
-        storages.push(item);
-      }
-      delete next[`_storage_${i}_entity`];
-      delete next[`_storage_${i}_attribute`];
-      delete next[`_storage_${i}_total`];
-      delete next[`_storage_${i}_total_attribute`];
-      delete next[`_storage_${i}_unit`];
-      delete next[`_storage_${i}_name`];
-      delete next[`_storage_${i}_display`];
+    // Lists owned by the list UI — carried over from the current config so
+    // the main form can never drop or alter them.
+    const cur = this._config?.metrics || {};
+    if (Array.isArray(cur.storages)) {
+      if (cur.storages.length) metrics.storages = cur.storages;
+    } else {
+      for (const k of LEGACY_STORAGE_KEYS) if (isFilled(cur[k])) metrics[k] = cur[k];
     }
-    if (storages.length) metrics.storages = storages;
+    if (Array.isArray(cur.custom) && cur.custom.length) metrics.custom = cur.custom;
     if (Object.keys(metrics).length) next.metrics = metrics;
     else delete next.metrics;
 
-    const drives = [];
-    for (let i = 1; i <= DRIVE_SLOTS; i++) {
-      const status = next[`_drive_${i}_status`];
-      if (status) {
-        const item = { status };
-        if (next[`_drive_${i}_temp`]) item.temp = next[`_drive_${i}_temp`];
-        if (next[`_drive_${i}_name`]) item.name = next[`_drive_${i}_name`];
-        // The form has no fields for nested volumes; preserve any from the
-        // current config (matched by slot↔drive index) so editing in the
-        // UI doesn't strip a grouped Drive→Volumes layout.
-        const prevVolumes = this._config?.drives?.[i - 1]?.volumes;
-        if (Array.isArray(prevVolumes) && prevVolumes.length) item.volumes = prevVolumes;
-        drives.push(item);
-      }
-      delete next[`_drive_${i}_status`];
-      delete next[`_drive_${i}_temp`];
-      delete next[`_drive_${i}_name`];
+    const drives = this._config?.drives;
+    if (Array.isArray(drives) && drives.length) {
+      next.drives = drives.map(({ status, temp, name }) => ({ status, temp, name }));
     }
-    if (drives.length) next.drives = drives;
     else delete next.drives;
-
-    // metrics.custom is owned by the list UI — carry it over from the
-    // current config so the main form can never drop or alter it.
-    if (this._customList().length) metrics.custom = this._customList();
-    if (Object.keys(metrics).length) next.metrics = metrics;
-    else delete next.metrics;
     return next;
   }
 
   // ── Config plumbing ────────────────────────────────────────────
-
-  _customList() {
-    return Array.isArray(this._config?.metrics?.custom) ? this._config.metrics.custom : [];
-  }
 
   _fireConfig(next) {
     this._config = next;
@@ -2686,15 +2680,58 @@ class PcControlCardEditor extends HTMLElementBase {
     );
   }
 
-  // Commit a new metrics.custom list: update the config, tell HA, refresh.
-  _setCustom(list) {
+  // The rows of a list.
+  _listGet(kind) {
+    const c = this._config || {};
+    const m = c.metrics || {};
+    if (kind === "custom") return Array.isArray(m.custom) ? m.custom : [];
+    if (kind === "storages") return Array.isArray(m.storages) ? m.storages : legacyStorages(m);
+    if (kind === "drives") return Array.isArray(c.drives) ? c.drives : [];
+    return [];
+  }
+
+  // Commit a new list: update the config, tell HA, refresh.
+  _setList(kind, list) {
     const next = { ...this._config };
-    const metrics = { ...(next.metrics || {}) };
-    if (list.length) metrics.custom = list;
-    else delete metrics.custom;
-    if (Object.keys(metrics).length) next.metrics = metrics;
-    else delete next.metrics;
+    if (kind === "drives") {
+      const drives = list.map(({ status, temp, name }) => ({ status, temp, name }));
+      if (drives.length) next.drives = drives;
+      else delete next.drives;
+    } else {
+      const metrics = { ...(next.metrics || {}) };
+      if (kind === "storages") for (const k of LEGACY_STORAGE_KEYS) delete metrics[k];
+      if (list.length) metrics[kind] = list;
+      else delete metrics[kind];
+      if (Object.keys(metrics).length) next.metrics = metrics;
+      else delete next.metrics;
+    }
     this._fireConfig(next);
+    this._render();
+  }
+
+  _viewKey() {
+    const v = this._view;
+    return v ? `${v.kind}:${v.i}${v.j != null ? `:${v.j}` : ""}` : "main";
+  }
+
+  // The config row the sub-editor is currently editing (or null).
+  _viewItem() {
+    const v = this._view;
+    if (!v) return null;
+    return this._listGet(v.kind)[v.i] || null;
+  }
+
+  _openRow(kind, i) {
+    this._view = { kind, i };
+    this._yaml = false;
+    this._maxMode = null;
+    this._render();
+  }
+
+  _back() {
+    this._view = null;
+    this._yaml = false;
+    this._maxMode = null;
     this._render();
   }
 
@@ -2703,25 +2740,40 @@ class PcControlCardEditor extends HTMLElementBase {
   _render() {
     if (!this._hass || !this._config) return;
     // The row being edited may vanish (config replaced from the code editor).
-    if (this._view != null && !this._customList()[this._view]) {
+    if (this._view && !this._viewItem()) {
       this._view = null;
       this._yaml = false;
       this._maxMode = null;
     }
-    const want = this._view == null ? "main" : "sub";
+    const want = this._viewKey();
     if (this._mounted !== want) this._mount(want);
-    if (want === "main") this._refreshMain();
-    else this._refreshSub();
+    if (this._view) this._refreshSub();
+    else this._refreshMain();
   }
 
-  // Build the static skeleton of a view (main list or row sub-editor).
+  // Heading + hint + row list + "add" box of one list.
+  _buildSection(kind) {
+    const def = LIST_DEFS[kind];
+    const sec = document.createElement("div");
+    sec.className = "cm-section";
+    sec.dataset.kind = kind;
+    sec.innerHTML = `
+      <h3 class="cm-title">${def.title}</h3>
+      <div class="cm-hint">${def.hint}</div>
+      <div class="cm-list"></div>
+      <div class="cm-add"></div>
+    `;
+    return sec;
+  }
+
+  // Build the static skeleton of a view (main view or a row sub-editor).
   _mount(want) {
     const root = this.shadowRoot;
     root.innerHTML = `<style>${EDITOR_STYLES}</style>`;
     this._mounted = want;
+    this._adding.clear();
 
-    if (want === "main") {
-      this._adding = false;
+    if (!this._view) {
       const wrap = document.createElement("div");
       wrap.className = "wrap";
 
@@ -2734,35 +2786,23 @@ class PcControlCardEditor extends HTMLElementBase {
       });
       wrap.appendChild(form);
 
-      const sec = document.createElement("div");
-      sec.className = "cm-section";
-      sec.innerHTML = `
-        <h3 class="cm-title">Custom metrics</h3>
-        <div class="cm-hint">Extra rows for the Chip &amp; Feature variants. Pick an entity, then use the pencil to set a name, attribute, unit, <code>{value}</code> template or a progress bar.</div>
-        <div class="cm-list"></div>
-        <div class="cm-add"></div>
-      `;
-      wrap.appendChild(sec);
+      for (const kind of MAIN_LISTS) wrap.appendChild(this._buildSection(kind));
       root.appendChild(wrap);
       return;
     }
 
     // Sub-editor skeleton
+    const kind = this._view.kind;
     const sub = document.createElement("div");
     sub.className = "wrap sub";
     sub.innerHTML = `
-      <div class="sub-head"><div class="sub-title">Custom metric editor</div></div>
+      <div class="sub-head"><div class="sub-title">${SUB_DEFS[kind].title}</div></div>
       <div class="sub-body"></div>
     `;
     const head = sub.querySelector(".sub-head");
     const back = haIconButton("back", "Back", "back");
     const code = haIconButton("code", "Show code editor", "code");
-    back.addEventListener("click", () => {
-      this._view = null;
-      this._yaml = false;
-      this._maxMode = null;
-      this._render();
-    });
+    back.addEventListener("click", () => this._back());
     code.addEventListener("click", () => {
       this._yaml = !this._yaml;
       this._render();
@@ -2780,29 +2820,38 @@ class PcControlCardEditor extends HTMLElementBase {
       form.hass = this._hass;
       form.data = this._flatten(this._config);
     }
-    this._syncRows();
-    this._syncAdd();
+    this._refreshSections();
   }
 
-  // Keep the row list in step with config.metrics.custom. Rows are rebuilt
+  _refreshSections() {
+    this.shadowRoot.querySelectorAll(".cm-section").forEach((sec) => {
+      this._syncRows(sec);
+      this._syncAdd(sec);
+    });
+  }
+
+  // Keep a section's row list in step with its config list. Rows are rebuilt
   // only when the count changes; otherwise each row's picker is updated in
   // place (also what makes a drag-reorder just a data swap).
-  _syncRows() {
-    const cont = this.shadowRoot.querySelector(".cm-list");
+  _syncRows(sec) {
+    const kind = sec.dataset.kind;
+    const def = LIST_DEFS[kind];
+    const cont = sec.querySelector(".cm-list");
     if (!cont) return;
-    const list = this._customList();
+    const list = this._listGet(kind);
     if (cont.children.length !== list.length) {
       cont.innerHTML = "";
-      list.forEach(() => cont.appendChild(this._buildRow(cont)));
+      list.forEach(() => cont.appendChild(this._buildRow(kind, cont)));
     }
     [...cont.children].forEach((row, i) => {
       const f = row.querySelector("ha-form");
       f.hass = this._hass;
-      f.data = { entity: list[i].entity || "" };
+      f.data = { [def.key]: list[i]?.[def.key] || "" };
     });
   }
 
-  _buildRow(cont) {
+  _buildRow(kind, cont) {
+    const def = LIST_DEFS[kind];
     const row = document.createElement("div");
     row.className = "cm-row";
     const handle = document.createElement("div");
@@ -2818,40 +2867,37 @@ class PcControlCardEditor extends HTMLElementBase {
     // Rows are positional: DOM order always mirrors the config order.
     const idx = () => [...cont.children].indexOf(row);
 
-    form.schema = CUSTOM_ROW_SCHEMA;
+    form.schema = def.rowSchema;
     form.computeLabel = () => ""; // like the official rows: no label, just the picker
     form.addEventListener("value-changed", (e) => {
       e.stopPropagation();
-      const ent = e.detail?.value?.entity;
-      const list = [...this._customList()];
+      const ent = e.detail?.value?.[def.key];
+      const list = [...this._listGet(kind)];
       const i = idx();
-      if (!ent || i < 0 || !list[i] || list[i].entity === ent) return;
-      list[i] = { ...list[i], entity: ent };
-      this._setCustom(list);
+      if (!ent || i < 0 || !list[i] || list[i][def.key] === ent) return;
+      list[i] = { ...list[i], [def.key]: ent };
+      this._setList(kind, list);
     });
 
     rm.addEventListener("click", () => {
-      const list = [...this._customList()];
+      const list = [...this._listGet(kind)];
       const i = idx();
       if (i < 0) return;
       list.splice(i, 1);
-      this._setCustom(list);
+      this._setList(kind, list);
     });
     ed.addEventListener("click", () => {
       const i = idx();
       if (i < 0) return;
-      this._view = i;
-      this._yaml = false;
-      this._maxMode = null;
-      this._render();
+      this._openRow(kind, i);
     });
-    this._bindDrag(handle, row, cont);
+    this._bindDrag(handle, row, cont, kind);
     return row;
   }
 
   // Drag-to-reorder on the handle. The dragged row follows the pointer;
   // the others slide out of the way. On release the new order is committed.
-  _bindDrag(handle, row, cont) {
+  _bindDrag(handle, row, cont, kind) {
     handle.addEventListener("pointerdown", (e) => {
       if (e.button !== undefined && e.button !== 0) return;
       const rows = [...cont.children];
@@ -2909,9 +2955,9 @@ class PcControlCardEditor extends HTMLElementBase {
           r.classList.remove("dragging", "shifting");
         });
         if (commit && to !== from) {
-          const list = [...this._customList()];
+          const list = [...this._listGet(kind)];
           list.splice(to, 0, list.splice(from, 1)[0]);
-          this._setCustom(list);
+          this._setList(kind, list);
         }
       };
       const onUp = () => finish(true);
@@ -2923,13 +2969,15 @@ class PcControlCardEditor extends HTMLElementBase {
     });
   }
 
-  // "Add entity" — HA's tonal small button (same as the Entities card), which
+  // "Add …" — HA's tonal small button (same as the Entities card), which
   // swaps for a one-shot entity picker. Picking an entity appends a row and
   // puts the button back.
-  _makeAddButton() {
+  _makeAddButton(kind) {
+    const label = LIST_DEFS[kind].addLabel;
     const onClick = () => {
-      this._adding = true;
-      this._syncAdd();
+      this._adding.add(kind);
+      const sec = this.shadowRoot.querySelector(`.cm-section[data-kind="${kind}"]`);
+      if (sec) this._syncAdd(sec);
     };
     if (customElements.get("ha-button")) {
       const b = document.createElement("ha-button");
@@ -2939,22 +2987,24 @@ class PcControlCardEditor extends HTMLElementBase {
       const ic = document.createElement("ha-svg-icon");
       ic.slot = "start";
       ic.path = EDITOR_ICONS.add;
-      b.append(ic, "Add entity");
+      b.append(ic, label);
       b.addEventListener("click", onClick);
       return b;
     }
     const b = document.createElement("button");
     b.type = "button";
     b.className = "add-btn";
-    b.innerHTML = `${eIcon("add")}<span>Add entity</span>`;
+    b.innerHTML = `${eIcon("add")}<span>${label}</span>`;
     b.addEventListener("click", onClick);
     return b;
   }
 
-  _syncAdd() {
-    const box = this.shadowRoot.querySelector(".cm-add");
+  _syncAdd(sec) {
+    const kind = sec.dataset.kind;
+    const def = LIST_DEFS[kind];
+    const box = sec.querySelector(".cm-add");
     if (!box) return;
-    const mode = this._adding ? "picker" : "button";
+    const mode = this._adding.has(kind) ? "picker" : "button";
     if (box.dataset.mode === mode) {
       const f = box.querySelector("ha-form");
       if (f) f.hass = this._hass;
@@ -2964,26 +3014,26 @@ class PcControlCardEditor extends HTMLElementBase {
     box.innerHTML = "";
 
     if (mode === "button") {
-      box.appendChild(this._makeAddButton());
+      box.appendChild(this._makeAddButton(kind));
       return;
     }
 
     const f = document.createElement("ha-form");
     f.hass = this._hass;
-    f.schema = CUSTOM_ROW_SCHEMA;
-    f.data = { entity: "" };
-    f.computeLabel = () => "Entity";
+    f.schema = def.rowSchema;
+    f.data = { [def.key]: "" };
+    f.computeLabel = () => def.pickerLabel;
     f.addEventListener("value-changed", (e) => {
       e.stopPropagation();
-      const ent = e.detail?.value?.entity;
+      const ent = e.detail?.value?.[def.key];
       if (!ent) return;
-      this._adding = false;
-      this._setCustom([...this._customList(), { entity: ent }]);
+      this._adding.delete(kind);
+      this._setList(kind, [...this._listGet(kind), { [def.key]: ent }]);
     });
     const cancel = haIconButton("close", "Cancel", "cancel");
     cancel.addEventListener("click", () => {
-      this._adding = false;
-      this._syncAdd();
+      this._adding.delete(kind);
+      this._syncAdd(sec);
     });
     box.append(f, cancel);
   }
@@ -2992,7 +3042,9 @@ class PcControlCardEditor extends HTMLElementBase {
 
   _refreshSub() {
     const root = this.shadowRoot;
-    const item = this._customList()[this._view] || {};
+    const kind = this._view.kind;
+    const def = SUB_DEFS[kind];
+    const item = this._viewItem() || {};
     // Like the official sub-editor, the toggle swaps its glyph: `{}` while the
     // visual form is shown, a form icon while the code view is shown.
     const codeBtn = root.querySelector(".code");
@@ -3010,38 +3062,26 @@ class PcControlCardEditor extends HTMLElementBase {
     if (mode === "gui") {
       const f = body.querySelector("ha-form");
       f.hass = this._hass;
-      // Swap the schema only when the display or the maximum source flips.
-      // A legacy `bar: true` row opens as "Progress bar".
-      const display = item.display === "bar" || item.display === "graph" ? item.display : item.bar ? "bar" : "none";
-      const maxMode = this._maxMode ?? (item.max_entity ? "entity" : "value");
-      const schemaKey = `${display}|${maxMode}`;
+      const ui = { maxMode: this._maxMode ?? (item.max_entity ? "entity" : "value") };
+      const schemaKey = def.schemaKey(item, ui);
       if (f._schemaKey !== schemaKey) {
         f._schemaKey = schemaKey;
-        f.schema = customRowSchema(display, maxMode);
+        f.schema = def.schema(item, ui);
       }
-      f.data = {
-        entity: item.entity || "",
-        name: item.name,
-        attribute: item.attribute,
-        unit: item.unit,
-        template: item.template,
-        display,
-        max_source: maxMode,
-        max: item.max,
-        max_entity: item.max_entity,
-        max_attribute: item.max_attribute,
-      };
+      f.data = def.toForm(item, ui);
     } else {
       // The code view keeps its own text while typing; only hass is refreshed.
       const y = body.firstElementChild;
       if (y && "hass" in y) y.hass = this._hass;
     }
+
   }
 
   _buildSubForm() {
+    const def = SUB_DEFS[this._view.kind];
     const f = document.createElement("ha-form");
-    f.computeLabel = (s) => CUSTOM_ROW_LABELS[s.name] || s.name;
-    f.computeHelper = (s) => CUSTOM_ROW_HELPERS[s.name];
+    f.computeLabel = (s) => def.labels[s.name] || s.name;
+    f.computeHelper = (s) => def.helpers[s.name];
     f.addEventListener("value-changed", (e) => {
       e.stopPropagation();
       this._maxMode = e.detail.value?.max_source || null;
@@ -3084,29 +3124,13 @@ class PcControlCardEditor extends HTMLElementBase {
     return ta;
   }
 
-  // Form values → a clean row: empty fields are dropped, `max` only kept
-  // with a bar, and any key the form doesn't manage (hand-written YAML) is
-  // preserved.
+  // Form values → a clean row. Any key the form doesn't manage is preserved.
   _formToRow(v) {
-    const out = { entity: v.entity || "" };
-    for (const k of ["name", "attribute", "unit", "template"]) {
-      if (v[k] !== undefined && v[k] !== null && v[k] !== "") out[k] = v[k];
-    }
-    if (v.display === "bar" || v.display === "graph") {
-      out.display = v.display;
-      if (v.max_source === "entity") {
-        if (v.max_entity) {
-          out.max_entity = v.max_entity;
-          if (v.max_attribute) out.max_attribute = v.max_attribute;
-        }
-      } else {
-        const m = Number(v.max);
-        if (v.max !== undefined && v.max !== null && v.max !== "" && Number.isFinite(m)) out.max = m;
-      }
-    }
-    const prev = this._customList()[this._view] || {};
+    const def = SUB_DEFS[this._view.kind];
+    const out = def.fromForm(v);
+    const prev = this._viewItem() || {};
     for (const k of Object.keys(prev)) {
-      if (!CUSTOM_ROW_KEYS.includes(k)) out[k] = prev[k];
+      if (!def.keys.includes(k)) out[k] = prev[k];
     }
     return out;
   }
@@ -3114,11 +3138,12 @@ class PcControlCardEditor extends HTMLElementBase {
   // `fromForm` rows come from the visual form, which tracks the maximum's
   // source itself; code-view edits re-derive it from the row.
   _applyRow(row, fromForm = false) {
-    if (this._view == null) return;
+    const v = this._view;
+    if (!v) return;
     if (!fromForm) this._maxMode = null;
-    const list = [...this._customList()];
-    list[this._view] = row;
-    this._setCustom(list);
+    const list = [...this._listGet(v.kind)];
+    list[v.i] = row;
+    this._setList(v.kind, list);
   }
 }
 

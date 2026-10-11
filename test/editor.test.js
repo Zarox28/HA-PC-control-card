@@ -5,26 +5,25 @@ import '../pc-control-card.js';
 
 const editor = () => document.createElement('pc-control-card-editor');
 
-test('unflatten builds a drives array from flat fields', () => {
-  const out = editor()._unflatten({
+test('editor keeps drives outside the main form and strips nested volumes', () => {
+  const el = editor();
+  const cfg = {
     status_entity: 'binary_sensor.nas',
-    _drive_1_status: 'sensor.d1_status',
-    _drive_1_temp: 'sensor.d1_temp',
-    _drive_1_name: 'Drive 1',
-    _drive_2_status: 'sensor.d2_status',
-  });
-  assert.deepEqual(out.drives, [
-    { status: 'sensor.d1_status', temp: 'sensor.d1_temp', name: 'Drive 1' },
-    { status: 'sensor.d2_status' },
-  ]);
-  assert.equal(out._drive_1_status, undefined);
-});
-
-test('flatten spreads a drives array into flat fields', () => {
-  const flat = editor()._flatten({ status_entity: 'binary_sensor.nas', drives: [{ status: 'sensor.d1_status', name: 'Drive 1' }] });
-  assert.equal(flat._drive_1_status, 'sensor.d1_status');
-  assert.equal(flat._drive_1_name, 'Drive 1');
-  assert.equal(flat._drive_2_status, undefined);
+    drives: [{
+      status: 'sensor.d1_status',
+      temp: 'sensor.d1_temp',
+      name: 'Drive 1',
+      volumes: [{ entity: 'sensor.volume_used' }],
+    }],
+  };
+  el.setConfig(cfg);
+  const flat = el._flatten(cfg);
+  assert.equal(flat.drives, undefined);
+  assert.deepEqual(el._unflatten(flat).drives, [{
+    status: 'sensor.d1_status',
+    temp: 'sensor.d1_temp',
+    name: 'Drive 1',
+  }]);
 });
 
 test('restart + uptime + icon keys survive the flatten/unflatten round-trip', () => {
