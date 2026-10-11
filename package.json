@@ -1,6 +1,6 @@
 {
   "name": "pc-control-card",
-  "version": "1.9.1",
+  "version": "1.9.2",
   "description": "A Home Assistant Lovelace card for controlling PCs and NAS devices with status, uptime, metrics, storage volumes, and drive health.",
   "type": "module",
   "main": "pc-control-card.js",

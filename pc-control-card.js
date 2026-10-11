@@ -9,7 +9,7 @@
  *                 one bar per disk, custom rows) + uptime + 3 actions
  */
 
-const CARD_VERSION = "1.9.1";
+const CARD_VERSION = "1.9.2";
 
 // ── State machine ───────────────────────────────────────────────────
 //   off / on are derived from the binary_sensor.
@@ -769,6 +769,28 @@ const STYLES = `
   flex-shrink: 0;
 }
 .chip .mini-stat { text-align: right; min-width: 0; }
+.chip .mini-stat.info-row,
+.feature .metric.info-row,
+.feature .drive.info-row,
+.feature .uptime.info-row {
+  cursor: pointer;
+}
+.info-row:focus,
+.info-row:focus-visible,
+.info-row:focus-within {
+  outline: none !important;
+  box-shadow: none !important;
+}
+.card:has(.info-row:focus) {
+  outline: none !important;
+  box-shadow: none !important;
+}
+.chip .mini-stat.info-row:hover,
+.feature .metric.info-row:hover,
+.feature .drive.info-row:hover,
+.feature .uptime.info-row:hover {
+  opacity: 0.78;
+}
 .chip .mini-stat .mlabel {
   font-size: 10px; color: var(--spc-fg-2);
   letter-spacing: 0.06em; text-transform: uppercase;
@@ -1526,6 +1548,32 @@ export class PcControlCard extends HTMLElementBase {
     this._callAction("restart");
   }
 
+  // Resolve the entity represented by an information row. More-info is
+  // opened through HA's standard event so the card works in every dashboard.
+  _infoEntity(key) {
+    if (key === "uptime") return this._config.uptime_entity || this._config.status_entity;
+    if (key === "drives_summary") return null;
+    if (key.startsWith("drive_")) {
+      return this._drives?.[parseInt(key.slice(6), 10)]?.status || null;
+    }
+    if (key.startsWith("custom_")) {
+      return this._customs?.[parseInt(key.slice(7), 10)]?.entity || null;
+    }
+    return this._metricSource(key)?.entityId || null;
+  }
+
+  _showMoreInfo(key) {
+    const entityId = this._infoEntity(key);
+    if (!entityId || !this._hass?.states?.[entityId]) return;
+    this.dispatchEvent(
+      new CustomEvent("hass-more-info", {
+        detail: { entityId },
+        bubbles: true,
+        composed: true,
+      }),
+    );
+  }
+
   _arm(name) {
     this._armed[name] = true;
     this._update();
@@ -1580,6 +1628,26 @@ export class PcControlCard extends HTMLElementBase {
     $(".btn-sleep").addEventListener("click", () => this._onSleep());
     $(".btn-restart").addEventListener("click", () => this._onRestart());
     $(".btn-shutdown").addEventListener("click", () => this._onShutdown());
+
+    // Information rows use event delegation because their visibility changes
+    // during updates, while the shadow DOM itself is only rebuilt on config.
+    if (!this._infoEventsWired) {
+      this._infoEventsWired = true;
+      this.shadowRoot.addEventListener("click", (ev) => {
+        const row = ev.target.closest?.("[data-info-key]");
+        if (row) {
+          this._showMoreInfo(row.dataset.infoKey);
+          row.blur();
+        }
+      });
+      this.shadowRoot.addEventListener("keydown", (ev) => {
+        if (ev.key !== "Enter" && ev.key !== " ") return;
+        const row = ev.target.closest?.("[data-info-key]");
+        if (!row) return;
+        ev.preventDefault();
+        this._showMoreInfo(row.dataset.infoKey);
+      });
+    }
 
     // Tick uptime + animations.
     clearInterval(this._tickTimer);
@@ -1879,7 +1947,7 @@ const TEMPLATES = {
         <div class="mini-stats" style="display:none">
           ${METRIC_KEYS.map(
             (k) => `
-          <div class="mini-stat" data-key="${k}">
+          <div class="mini-stat info-row" data-key="${k}" data-info-key="${k}" role="button" tabindex="0">
             <div class="mlabel">${METRIC_LABELS[k]}</div>
             <div class="mval">—</div>
           </div>
@@ -1888,7 +1956,7 @@ const TEMPLATES = {
           ${storages
             .map(
               (s, i) => `
-          <div class="mini-stat" data-key="storage_${i}">
+          <div class="mini-stat info-row" data-key="storage_${i}" data-info-key="storage_${i}" role="button" tabindex="0">
             <div class="mlabel">${escapeHtml(s.name).toUpperCase()}</div>
             <div class="mval">—</div>
           </div>
@@ -1898,7 +1966,7 @@ const TEMPLATES = {
           ${customs
             .map(
               (_c, i) => `
-          <div class="mini-stat custom" data-key="custom_${i}">
+          <div class="mini-stat custom info-row" data-key="custom_${i}" data-info-key="custom_${i}" role="button" tabindex="0">
             <div class="mlabel"></div>
             <div class="mval">—</div>
           </div>
@@ -1935,7 +2003,7 @@ const TEMPLATES = {
           <div class="name"></div>
           <div class="status"><span class="dot"></span><span class="label"></span><span class="anim"></span></div>
         </div>
-        <div class="uptime">
+        <div class="uptime info-row" data-info-key="uptime" role="button" tabindex="0">
           <div class="ulabel">Uptime</div>
           <div class="uval">—</div>
         </div>
@@ -1998,7 +2066,7 @@ function metricRow(key, label, nested, opts = {}) {
         ? '<div class="metric-bar"><div class="fill"></div></div>'
         : "";
   return `
-    <div class="metric${nested ? " nested" : ""}${opts.custom ? " custom" : ""}${kind === "none" ? " no-bar" : ""}${kind === "graph" ? " has-graph" : ""}" data-key="${key}">
+    <div class="metric info-row${nested ? " nested" : ""}${opts.custom ? " custom" : ""}${kind === "none" ? " no-bar" : ""}${kind === "graph" ? " has-graph" : ""}" data-key="${key}" data-info-key="${key}" role="button" tabindex="0">
       <div class="metric-head">
         <span class="mlabel">${label}</span>
         <span class="mval">—</span>
@@ -2010,7 +2078,7 @@ function metricRow(key, label, nested, opts = {}) {
 
 function driveRow(key, label) {
   return `
-    <div class="drive" data-key="${key}">
+    <div class="drive info-row" data-key="${key}" data-info-key="${key}" role="button" tabindex="0">
       <span class="ddot"></span>
       <span class="dname">${label}</span>
       <span class="dval">—</span>
